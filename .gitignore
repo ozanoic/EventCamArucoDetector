@@ -1,0 +1,18 @@
+# Data (too large for git)
+Data/
+RelatedDocs/
+
+# MATLAB results & generated files
+*.mat
+*.avi
+*.asv
+
+# Empty leftover folder
+Project/
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
