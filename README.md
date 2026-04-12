@@ -17,7 +17,8 @@ Achieves ~92% detection rate on synthetic ESIM data (95.9% with extended windows
 
 | File | Description |
 |------|-------------|
-| `main.m` | Main detection script with multi-window sliding and optional parallelization |
+| `main.m` | Entry point — configure input file and parameters |
+| `detectAruco.m` | Core detection engine: multi-window sliding with optional parallelization |
 | `detectQuadBlob.m` | Blob-based quadrilateral detection (imfill + watershed + convex hull) |
 | `findQuadCandidates.m` | Region filtering, minimum-area rectangle fitting |
 | `loadEvents.m` | Load events from .aedat, .mat, or text files |
