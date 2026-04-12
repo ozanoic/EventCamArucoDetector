@@ -4,7 +4,7 @@
 clear; close all; clc;
 
 %% ---- Input ----
-matFile    = '../Data/Synthetic/MovingCam/moving_events_fast/moving_events_fast.mat';
+matFile    = 'Data/moving_events_fast/moving_events_fast.mat';
 sensorSize = [240, 320];   % [height, width]
 
 %% ---- Parameters ----
@@ -26,5 +26,7 @@ params.blobParams.maxAspect = 3.0;
 results = detectAruco(matFile, sensorSize, params);
 
 %% ---- Save results ----
-save('resultTable.mat', '-struct', 'results');
-fprintf('Results saved to resultTable.mat\n');
+[inputDir, inputName, ~] = fileparts(matFile);
+outputFile = fullfile(inputDir, [inputName '_results.mat']);
+save(outputFile, '-struct', 'results');
+fprintf('Results saved to %s\n', outputFile);
