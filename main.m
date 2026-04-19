@@ -3,6 +3,9 @@
 
 clear; close all; clc;
 
+% Make utility functions (converters, loaders, generators, visualizers) available
+addpath('Utils');
+
 %% ---- Input ----
 matFile    = 'Data/moving_events_fast/moving_events_fast.mat';
 sensorSize = [240, 320];   % [height, width]

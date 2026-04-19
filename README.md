@@ -15,12 +15,20 @@ Achieves ~92% detection rate on synthetic ESIM data (95.9% with extended windows
 
 ## Files
 
+### Core files (root)
+
 | File | Description |
 |------|-------------|
 | `main.m` | Entry point — configure input file and parameters |
 | `detectAruco.m` | Core detection engine: multi-window sliding with optional parallelization |
+| `analyzeResults.m` | Detailed analysis and visualization of a saved results file |
 | `detectQuadBlob.m` | Blob-based quadrilateral detection (imfill + watershed + convex hull) |
 | `findQuadCandidates.m` | Region filtering, minimum-area rectangle fitting |
+
+### Utility files (`Utils/`)
+
+| File | Description |
+|------|-------------|
 | `loadEvents.m` | Load events from .aedat, .mat, or text files |
 | `convertEsimTxt2Mat.m` | Convert ESIM simulator text output to .mat |
 | `convertSarmadiBin.m` | Read Sarmadi binary event format |
