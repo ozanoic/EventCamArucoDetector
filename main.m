@@ -7,13 +7,16 @@ clear; close all; clc;
 addpath('Utils');
 
 %% ---- Input ----
-matFile    = 'Data/moving_events_fast/moving_events_fast.mat';
+matFile    = 'Data/marker_z2_zoom_high/marker_z2_zoom_high.mat';
 sensorSize = [240, 320];   % [height, width]
 
 %% ---- Parameters ----
-params.windowDurations_ms = [5, 10, 15, 20, 30, 50, 70, 100, 125, 150];
+% params.windowDurations_ms = [5, 10, 15, 20, 30, 50, 70, 100, 125, 150];
+% params.windowDurations_ms = [150, 200, 250, 300, 350, 400, 450, 500, 600, 700];
+params.windowDurations_ms = [100];
 params.tickStep_us        = 1000;       % 1 ms tick step
-params.showVis            = false;
+params.showVis            = 1;
+params.useParallel        = true;       % true = use parfor if toolbox is available; false = always sequential
 
 % Marker grid (ARUCO_MIP_36h12: 8x8 grid, 6x6 inner code)
 params.numCells = 8;

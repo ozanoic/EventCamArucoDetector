@@ -10,6 +10,8 @@ function results = detectAruco(matFile, sensorSize, params)
 %      .windowDurations_ms  - vector of lookback windows in ms (e.g. [5 10 20 50 100])
 %      .tickStep_us         - tick step in microseconds (default 1000)
 %      .showVis             - enable per-tick visualization (default false)
+%      .useParallel         - true: use parfor if toolbox available (default);
+%                             false: force sequential execution
 %      .numCells            - marker grid size (default 8)
 %      .codeSize            - inner code grid size (default 6)
 %      .cellPx              - pixels per cell in unwarped image (default 20)
@@ -26,6 +28,7 @@ function results = detectAruco(matFile, sensorSize, params)
 %% ---- Default parameters ----
 if ~isfield(params,'tickStep_us'),  params.tickStep_us  = 1000;  end
 if ~isfield(params,'showVis'),      params.showVis      = false; end
+if ~isfield(params,'useParallel'),  params.useParallel  = true;  end
 if ~isfield(params,'numCells'),     params.numCells     = 8;     end
 if ~isfield(params,'codeSize'),     params.codeSize     = 6;     end
 if ~isfield(params,'cellPx'),       params.cellPx       = 20;    end
@@ -74,17 +77,22 @@ fprintf('Time range: %.3fs to %.3fs\n', tMin/1e6, tMax/1e6);
 fprintf('Ticks: %d  (every %d us = %.0f ms)\n', numTicks, tickStep_us, tickStep_us/1000);
 fprintf('Windows: %d  (%s ms)\n', numWindows, mat2str(windowDurations_ms));
 
-%% ---- Check for Parallel Computing Toolbox ----
-hasParallel = ~isempty(ver('parallel'));
-if hasParallel
-    fprintf('Parallel Computing Toolbox: FOUND\n');
-    pool = gcp('nocreate');
-    if isempty(pool)
-        pool = parpool('local');
+%% ---- Decide execution mode ----
+if params.useParallel
+    hasParallel = ~isempty(ver('parallel'));
+    if hasParallel
+        fprintf('useParallel=TRUE  |  Parallel Computing Toolbox: FOUND\n');
+        pool = gcp('nocreate');
+        if isempty(pool)
+            pool = parpool('local');
+        end
+        fprintf('Using %d workers\n', pool.NumWorkers);
+    else
+        fprintf('useParallel=TRUE  |  Parallel Computing Toolbox: NOT FOUND (falling back to sequential)\n');
     end
-    fprintf('Using %d workers\n', pool.NumWorkers);
 else
-    fprintf('Parallel Computing Toolbox: NOT FOUND (running sequential)\n');
+    hasParallel = false;
+    fprintf('useParallel=FALSE |  Running sequential (parallel disabled by user)\n');
 end
 
 %% ---- Preallocate output ----
@@ -294,7 +302,7 @@ ticksWithAnyDetection = sum(resultTable(:, 2));
 fprintf('\n========================================\n');
 fprintf('       PERFORMANCE SUMMARY\n');
 fprintf('========================================\n');
-fprintf('Parallel toolbox:        %s\n', ternary(hasParallel, 'YES', 'NO'));
+fprintf('Execution mode:          %s\n', ternary(hasParallel, 'PARALLEL', 'SEQUENTIAL'));
 fprintf('Total ticks:             %d\n', numTicks);
 fprintf('Ticks with detection:    %d (%.1f%%)\n', ...
     ticksWithAnyDetection, 100*ticksWithAnyDetection/max(numTicks,1));
