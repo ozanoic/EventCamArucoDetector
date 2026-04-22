@@ -6,20 +6,26 @@ function merged = mergeResults(resultFiles, outputFile)
 %
 %  Inputs:
 %    resultFiles - cell array of paths to result .mat files
-%                  (all must come from the same input, i.e. same timestamps)
+%                  (all must come from the same input, but can have
+%                  different timestamp ranges -- e.g. different window sets
+%                  produce different tStart, so tick counts may differ)
 %    outputFile  - optional path to save the merged result
 %
 %  Output:
-%    merged - combined struct with union of all windows, recomputed
-%             anyDetected and detectionsPerWindow
+%    merged - combined struct with union of all windows, aligned to the
+%             union of all timestamps, with recomputed anyDetected and
+%             detectionsPerWindow.
 %
 %  Behavior:
-%    - Validates that all files share the same tNow_us vector
-%    - Takes the union of window durations across all files
+%    - Takes the UNION of timestamps across all files
+%      (each window is aligned onto this master timeline; timestamps where
+%       a window was not computed are marked -1)
+%    - Validates that overlapping timestamps are identical across files
+%    - Takes the UNION of window durations across all files
 %    - If a window appears in multiple files, keeps the first occurrence
 %      (with a warning showing which file was kept)
 %    - Sorts windows by duration in the output
-%    - Recomputes anyDetected = any(win_* >= 0) across all merged windows
+%    - Recomputes anyDetected = any(win_* >= 0, 2) across all merged windows
 %    - Recomputes detectionsPerWindow from the merged win_* columns
 
 if nargin < 2, outputFile = ''; end
@@ -39,23 +45,22 @@ for k = 1:length(resultFiles)
     allData{k} = load(resultFiles{k});
 end
 
-%% ---- Validate matching timestamps ----
-refT = allData{1}.tNow_us;
-refN = length(refT);
-for k = 2:length(allData)
-    d = allData{k};
-    if length(d.tNow_us) ~= refN
-        error('mergeResults: file %d has %d ticks, file 1 has %d.', ...
-            k, length(d.tNow_us), refN);
-    end
-    if any(abs(double(d.tNow_us) - double(refT)) > 0.5)
-        error('mergeResults: file %d has different timestamps than file 1.', k);
-    end
+%% ---- Build union timeline ----
+allT = [];
+for k = 1:length(allData)
+    allT = [allT; double(allData{k}.tNow_us(:))]; %#ok<AGROW>
 end
-fprintf('  Timestamps match: %d ticks\n', refN);
+mergedT = unique(allT);           % sorted ascending, deduplicated
+refN = length(mergedT);
+
+fprintf('  Union timeline: %d ticks\n', refN);
+for k = 1:length(allData)
+    nk = length(allData{k}.tNow_us);
+    fprintf('    file [%d]: %d ticks  (%.1f%% of union)\n', k, nk, 100*nk/refN);
+end
 
 %% ---- Collect window columns from all files ----
-% Map window_ms -> (file index, column data, source file path)
+% Map window_ms -> entry with source file info and data aligned to its file's timeline
 winMap = containers.Map('KeyType', 'double', 'ValueType', 'any');
 
 for k = 1:length(allData)
@@ -77,9 +82,10 @@ for k = 1:length(allData)
             fprintf('  Duplicate window %dms: keeping file [%d], ignoring file [%d]\n', ...
                 winKey, existing.fileIdx, k);
         else
-            entry.fileIdx = k;
-            entry.data    = d.(colName);
-            entry.source  = resultFiles{k};
+            entry.fileIdx   = k;
+            entry.data      = d.(colName);
+            entry.sourceT   = double(d.tNow_us);
+            entry.source    = resultFiles{k};
             winMap(winKey) = entry;
         end
     end
@@ -90,41 +96,62 @@ allWins = sort(cell2mat(keys(winMap)));
 numWindows = length(allWins);
 fprintf('  Merged windows (%d): %s ms\n', numWindows, mat2str(allWins));
 
-%% ---- Build merged struct ----
-merged.tNow_us = refT;
+%% ---- Build merged struct on the union timeline ----
+merged.tNow_us = mergedT;
 
-% Fill in win_Xms fields in sorted order
 winMatrix = -1 * ones(refN, numWindows);
 for wi = 1:numWindows
     w = allWins(wi);
     entry = winMap(w);
     col = entry.data(:);
-    if length(col) ~= refN
-        error('mergeResults: win_%dms has %d rows, expected %d.', w, length(col), refN);
+
+    % Map source timestamps to indices in the union timeline
+    [isIn, idx] = ismember(entry.sourceT, mergedT);
+    if any(~isIn)
+        error('mergeResults: win_%dms has timestamps not in union (internal bug).', w);
     end
-    merged.(sprintf('win_%dms', w)) = col;
-    winMatrix(:, wi) = col;
+
+    if length(col) ~= length(entry.sourceT)
+        error('mergeResults: win_%dms data length (%d) != tNow_us length (%d) in its file.', ...
+            w, length(col), length(entry.sourceT));
+    end
+
+    % Place values at the right rows; rows with no data stay -1
+    winMatrix(idx, wi) = col;
+    merged.(sprintf('win_%dms', w)) = winMatrix(:, wi);
 end
 
 % Recompute overall detection
 merged.anyDetected = double(any(winMatrix >= 0, 2));
 
-% Recompute per-window detection counts
+% Recompute per-window detection counts (use >= 0, which excludes -1 = not-computed)
 merged.windowDurations_ms = allWins;
 merged.detectionsPerWindow = sum(winMatrix >= 0, 1);
+
+% Also record how many ticks each window was actually attempted on
+% (useful since windows may not cover the full union timeline)
+attempted = zeros(1, numWindows);
+for wi = 1:numWindows
+    entry = winMap(allWins(wi));
+    attempted(wi) = length(entry.sourceT);
+end
+merged.attemptedPerWindow = attempted;
 
 %% ---- Summary ----
 nAny = sum(merged.anyDetected);
 fprintf('\n--- Merged Summary ---\n');
 fprintf('Ticks:                 %d\n', refN);
 fprintf('Ticks w/ any detect:   %d  (%.1f%%)\n', nAny, 100*nAny/refN);
-fprintf('%-10s  %10s  %10s\n', 'Window', 'Detections', 'Rate');
-fprintf('%-10s  %10s  %10s\n', '------', '----------', '----');
+fprintf('%-10s  %10s  %10s  %10s  %10s\n', 'Window', 'Detect', 'Attempt', 'Rate/attempt', 'Rate/total');
+fprintf('%-10s  %10s  %10s  %10s  %10s\n', '------', '------', '-------', '------------', '----------');
 for wi = 1:numWindows
-    fprintf('%-10s  %10d  %9.1f%%\n', ...
+    nd = merged.detectionsPerWindow(wi);
+    na = merged.attemptedPerWindow(wi);
+    fprintf('%-10s  %10d  %10d  %11.1f%%  %9.1f%%\n', ...
         sprintf('%dms', allWins(wi)), ...
-        merged.detectionsPerWindow(wi), ...
-        100 * merged.detectionsPerWindow(wi) / refN);
+        nd, na, ...
+        100 * nd / max(na, 1), ...
+        100 * nd / refN);
 end
 
 %% ---- Save if requested ----
