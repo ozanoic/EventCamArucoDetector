@@ -1,18 +1,28 @@
-# Data (too large for git)
-Data/
+# ---- Data -----------------------------------------------------------------
+# Ignore the big raw inputs but whitelist the small essentials needed to
+# reproduce viewAllResults (merged per-dataset results + ground-truth + calib).
+Data/*
+Data/*/*
+
+# Whitelist: merged per-dataset result .mat files
+!Data/*/
+!Data/*/*_results.mat
+
+# Whitelist: ground-truth trajectories, calibration, marker texture
+!Data/trajectory_*.csv
+!Data/calib.yaml
+!Data/marker_texture.png
+
+# Related docs not tracked
 RelatedDocs/
 
-# MATLAB results & generated files
-*.mat
-*.avi
-*.asv
+# ---- MATLAB generated files (outside Data/) -------------------------------
+/*.mat
+**/*.avi
+**/*.asv
 
-# Empty leftover folder
+# ---- Misc -----------------------------------------------------------------
 Project/
-
-# Claude Code
 .claude/
-
-# OS
 Thumbs.db
 .DS_Store

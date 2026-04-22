@@ -40,6 +40,14 @@ if isempty(datasets)
     error('viewAllResults: no <name>_results.mat files found under %s', dataRoot);
 end
 
+% Sort datasets by (motion, speed) so speeds appear as low -> med -> high
+sortKeys = cell(length(datasets), 1);
+for i = 1:length(datasets)
+    sortKeys{i} = datasetSortKey(datasets(i).name);
+end
+[~, order] = sort(sortKeys);
+datasets = datasets(order);
+
 fprintf('Found %d dataset(s) under %s\n', length(datasets), dataRoot);
 for i = 1:length(datasets)
     fprintf('  [%2d] %s\n', i, datasets(i).name);
@@ -48,8 +56,28 @@ end
 %% ---- Build GUI ----
 fig = uifigure('Name', sprintf('Detection Results - %s', dataRoot), ...
     'Position', [60 60 1500 850]);
-tg = uitabgroup(fig, 'Position', [0 0 fig.Position(3) fig.Position(4)]);
-fig.SizeChangedFcn = @(src,~) set(tg, 'Position', [0 0 src.Position(3) src.Position(4)]);
+% Use a grid layout so the tabgroup resizes with the figure automatically
+% (avoids the SizeChangedFcn / AutoResizeChildren conflict warning).
+figGL = uigridlayout(fig, [2 1]);
+figGL.RowHeight   = {32, '1x'};
+figGL.Padding     = [4 4 4 4];
+figGL.RowSpacing  = 4;
+
+% --- Toolbar (save current tab / full window) ---
+tb = uigridlayout(figGL, [1 3]);
+tb.Layout.Row     = 1;
+tb.ColumnWidth    = {140, 160, '1x'};
+tb.Padding        = [0 0 0 0];
+tb.ColumnSpacing  = 6;
+btnTab = uibutton(tb, 'Text', 'Save Current Tab...', ...
+    'ButtonPushedFcn', @(~,~) saveCurrentTab(fig, tg));
+btnTab.Layout.Column = 1;
+btnAll = uibutton(tb, 'Text', 'Save Whole Window...', ...
+    'ButtonPushedFcn', @(~,~) saveWholeWindow(fig));
+btnAll.Layout.Column = 2;
+
+tg = uitabgroup(figGL);
+tg.Layout.Row = 2;
 
 %% ---- Tab 1: Summary ----
 summaryTab = uitab(tg, 'Title', 'Summary');
@@ -132,8 +160,9 @@ function buildSummaryTab(parent, datasets)
     % --- Overall detection bar chart ---
     barPanel = uipanel(gl, 'Title', 'Overall Detection Rate per Dataset');
     barPanel.Layout.Row = 1; barPanel.Layout.Column = 2;
-    ax1 = uiaxes(barPanel);
-    ax1.Units = 'normalized'; ax1.Position = [0.08 0.18 0.9 0.78];
+    barGL = uigridlayout(barPanel, [1 1]);
+    barGL.Padding = [5 5 5 5];
+    ax1 = uiaxes(barGL);
     b = bar(ax1, 1:n, overallRates);
     b.FaceColor = 'flat';
     cmap = turbo(n);
@@ -155,14 +184,15 @@ function buildSummaryTab(parent, datasets)
     % --- Heatmap: dataset × window ---
     hmPanel = uipanel(gl, 'Title', 'Detection Rate (%) -- Dataset × Window');
     hmPanel.Layout.Row = 2; hmPanel.Layout.Column = [1 2];
-    ax2 = uiaxes(hmPanel);
-    ax2.Units = 'normalized'; ax2.Position = [0.18 0.15 0.78 0.78];
+    hmGL = uigridlayout(hmPanel, [1 1]);
+    hmGL.Padding = [5 5 5 5];
+    ax2 = uiaxes(hmGL);
     imagesc(ax2, rateMat, 'AlphaData', ~isnan(rateMat));
     ax2.Color = [0.25 0.25 0.25];
     colormap(ax2, parula);
     cb = colorbar(ax2);
     cb.Label.String = 'Rate (%)';
-    caxis(ax2, [0 100]);
+    clim(ax2, [0 100]);
     ax2.XTick = 1:length(allWinMs);
     ax2.XTickLabel = arrayfun(@(x) sprintf('%dms', x), allWinMs, 'UniformOutput', false);
     ax2.XTickLabelRotation = 45;
@@ -203,21 +233,21 @@ function buildDetailTab(parent, dataset)
     end
     anyDet = d.anyDetected > 0;
 
-    % 2x2 layout: raster | bar / heatmap | rolling rate
-    gl = uigridlayout(parent, [3 2]);
-    gl.RowHeight = {35, '1x', '1x'};
-    gl.ColumnWidth = {'1.2x', '1x'};
+    % Layout: header, raster, per-window bar
+    gl = uigridlayout(parent, [3 1]);
+    gl.RowHeight = {35, '1.2x', '1x'};
 
     % --- Header label with key stats ---
     hdr = uilabel(gl, 'Text', buildHeaderText(name, d, anyDet, detMat, winMs), ...
         'FontWeight', 'bold', 'FontSize', 11);
-    hdr.Layout.Row = 1; hdr.Layout.Column = [1 2];
+    hdr.Layout.Row = 1;
 
     % --- Raster plot ---
     p1 = uipanel(gl, 'Title', 'Detection Timeline (per window)');
-    p1.Layout.Row = 2; p1.Layout.Column = [1 2];
-    ax1 = uiaxes(p1);
-    ax1.Units = 'normalized'; ax1.Position = [0.07 0.18 0.92 0.77];
+    p1.Layout.Row = 2;
+    p1GL = uigridlayout(p1, [1 1]);
+    p1GL.Padding = [5 5 5 5];
+    ax1 = uiaxes(p1GL);
     hold(ax1, 'on');
     cmap = hsv(numWindows);
     for wi = 1:numWindows
@@ -237,10 +267,11 @@ function buildDetailTab(parent, dataset)
     grid(ax1, 'on');
 
     % --- Per-window bar ---
-    p2 = uipanel(gl, 'Title', 'Detection Rate per Window');
-    p2.Layout.Row = 3; p2.Layout.Column = 1;
-    ax2 = uiaxes(p2);
-    ax2.Units = 'normalized'; ax2.Position = [0.12 0.22 0.85 0.72];
+    p2 = uipanel(gl, 'Title', 'Detection Rate per Window (rate = detections / attempts for that window)');
+    p2.Layout.Row = 3;
+    p2GL = uigridlayout(p2, [1 1]);
+    p2GL.Padding = [5 5 5 5];
+    ax2 = uiaxes(p2GL);
     rates = zeros(1, numWindows);
     for wi = 1:numWindows
         if isfield(d, 'attemptedPerWindow')
@@ -262,32 +293,6 @@ function buildDetailTab(parent, dataset)
         text(ax2, wi, rates(wi)+2, sprintf('%.0f%%', rates(wi)), ...
             'HorizontalAlignment', 'center', 'FontSize', 8);
     end
-
-    % --- Rolling rate ---
-    p3 = uipanel(gl, 'Title', 'Rolling Detection Rate');
-    p3.Layout.Row = 3; p3.Layout.Column = 2;
-    ax3 = uiaxes(p3);
-    ax3.Units = 'normalized'; ax3.Position = [0.1 0.22 0.87 0.72];
-    if nTicks > 1
-        durS = tSec(end) - tSec(1);
-        winS = max(0.5, durS / 20);
-        step = tSec(2) - tSec(1);
-        if step <= 0, step = 1e-3; end
-        winT = max(round(winS / step), 10);
-        hold(ax3, 'on');
-        for wi = 1:numWindows
-            rr = movmean(double(detMat(:, wi)), winT) * 100;
-            plot(ax3, tSec, rr, 'Color', [cmap(wi,:) 0.5], 'LineWidth', 0.8);
-        end
-        ra = movmean(double(anyDet), winT) * 100;
-        plot(ax3, tSec, ra, 'k-', 'LineWidth', 2);
-        hold(ax3, 'off');
-        xlim(ax3, [tSec(1) tSec(end)]);
-    end
-    ylim(ax3, [0 105]);
-    xlabel(ax3, 'Time (s)');
-    ylabel(ax3, 'Rate (%)');
-    grid(ax3, 'on');
 end
 
 
@@ -298,6 +303,61 @@ function s = shortenName(name)
     % Trim common prefix for readable tab / axis labels
     s = regexprep(name, '^marker_z2_', '');
     s = strrep(s, '_', ' ');
+end
+
+function k = datasetSortKey(name)
+    % Build a sort key that orders datasets by (motion, speed)
+    % where speed is forced to the sequence low -> med -> high.
+    base = regexprep(name, '^marker_z2_', '');
+    tok = regexp(base, '^(.*)_(low|med|high)$', 'tokens', 'once');
+    if isempty(tok)
+        k = ['z_' base];           % unknown pattern: sort to the end
+        return;
+    end
+    motion = tok{1};
+    speed  = tok{2};
+    switch speed
+        case 'low',  s = '1';
+        case 'med',  s = '2';
+        case 'high', s = '3';
+        otherwise,   s = '9';
+    end
+    k = [motion '_' s];
+end
+
+function saveWholeWindow(fig)
+    % Save the entire uifigure (all tabs composited as currently shown) to a file.
+    filters = {'*.png','PNG image (*.png)'; ...
+               '*.pdf','PDF document (*.pdf)'; ...
+               '*.jpg','JPEG image (*.jpg)'};
+    [file, path] = uiputfile(filters, 'Save window as', 'detection_results.png');
+    if isequal(file, 0), return; end
+    outPath = fullfile(path, file);
+    try
+        exportapp(fig, outPath);
+        uialert(fig, sprintf('Saved to:\n%s', outPath), 'Saved', 'Icon', 'success');
+    catch ME
+        uialert(fig, sprintf('Could not save: %s', ME.message), 'Save failed');
+    end
+end
+
+function saveCurrentTab(fig, tg)
+    % Save only the currently selected tab content.
+    currentTab = tg.SelectedTab;
+    tabTitle   = matlab.lang.makeValidName(currentTab.Title);
+    filters = {'*.png','PNG image (*.png)'; ...
+               '*.pdf','PDF document (*.pdf)'; ...
+               '*.jpg','JPEG image (*.jpg)'};
+    defaultName = ['detection_' tabTitle '.png'];
+    [file, path] = uiputfile(filters, 'Save current tab as', defaultName);
+    if isequal(file, 0), return; end
+    outPath = fullfile(path, file);
+    try
+        exportapp(currentTab, outPath);
+        uialert(fig, sprintf('Saved to:\n%s', outPath), 'Saved', 'Icon', 'success');
+    catch ME
+        uialert(fig, sprintf('Could not save: %s', ME.message), 'Save failed');
+    end
 end
 
 function txt = buildHeaderText(name, d, anyDet, detMat, winMs)

@@ -14,7 +14,7 @@ clear; close all; clc;
 %% ---- Settings ----
 % Choose which dataset to convert (comment/uncomment)
 % dataDir = '../Data/Synthetic/MovingCam/moving_events';
-dataDir = '../Data/Synthetic/MovingCam/moving_events_fast';
+dataDir = 'Data/marker_z2_zoom_med';
 
 %% ---- Read events ----
 eventsFile = fullfile(dataDir, 'events.txt');
