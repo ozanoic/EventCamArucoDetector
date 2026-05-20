@@ -63,18 +63,21 @@ figGL.RowHeight   = {32, '1x'};
 figGL.Padding     = [4 4 4 4];
 figGL.RowSpacing  = 4;
 
-% --- Toolbar (save current tab / full window) ---
-tb = uigridlayout(figGL, [1 3]);
+% --- Toolbar (save current tab / full window / all tabs) ---
+tb = uigridlayout(figGL, [1 4]);
 tb.Layout.Row     = 1;
-tb.ColumnWidth    = {140, 160, '1x'};
+tb.ColumnWidth    = {160, 170, 190, '1x'};
 tb.Padding        = [0 0 0 0];
 tb.ColumnSpacing  = 6;
-btnTab = uibutton(tb, 'Text', 'Save Current Tab...', ...
+btnTab = uibutton(tb, 'Text', 'Save Current Tab (PDF)...', ...
     'ButtonPushedFcn', @(~,~) saveCurrentTab(fig, tg));
 btnTab.Layout.Column = 1;
-btnAll = uibutton(tb, 'Text', 'Save Whole Window...', ...
+btnAll = uibutton(tb, 'Text', 'Save Whole Window (PDF)...', ...
     'ButtonPushedFcn', @(~,~) saveWholeWindow(fig));
 btnAll.Layout.Column = 2;
+btnEvery = uibutton(tb, 'Text', 'Save All Tabs (multi-page PDF)...', ...
+    'ButtonPushedFcn', @(~,~) saveAllTabs(fig, tg));
+btnEvery.Layout.Column = 3;
 
 tg = uitabgroup(figGL);
 tg.Layout.Row = 2;
@@ -326,11 +329,12 @@ function k = datasetSortKey(name)
 end
 
 function saveWholeWindow(fig)
-    % Save the entire uifigure (all tabs composited as currently shown) to a file.
-    filters = {'*.png','PNG image (*.png)'; ...
-               '*.pdf','PDF document (*.pdf)'; ...
+    % Save the entire uifigure (only the currently visible tab is captured;
+    % use "Save All Tabs" to get every tab).  PDF is the default.
+    filters = {'*.pdf','PDF document (*.pdf)'; ...
+               '*.png','PNG image (*.png)'; ...
                '*.jpg','JPEG image (*.jpg)'};
-    [file, path] = uiputfile(filters, 'Save window as', 'detection_results.png');
+    [file, path] = uiputfile(filters, 'Save window as', 'detection_results.pdf');
     if isequal(file, 0), return; end
     outPath = fullfile(path, file);
     try
@@ -342,13 +346,13 @@ function saveWholeWindow(fig)
 end
 
 function saveCurrentTab(fig, tg)
-    % Save only the currently selected tab content.
+    % Save only the currently selected tab content.  PDF by default.
     currentTab = tg.SelectedTab;
     tabTitle   = matlab.lang.makeValidName(currentTab.Title);
-    filters = {'*.png','PNG image (*.png)'; ...
-               '*.pdf','PDF document (*.pdf)'; ...
+    filters = {'*.pdf','PDF document (*.pdf)'; ...
+               '*.png','PNG image (*.png)'; ...
                '*.jpg','JPEG image (*.jpg)'};
-    defaultName = ['detection_' tabTitle '.png'];
+    defaultName = ['detection_' tabTitle '.pdf'];
     [file, path] = uiputfile(filters, 'Save current tab as', defaultName);
     if isequal(file, 0), return; end
     outPath = fullfile(path, file);
@@ -357,6 +361,89 @@ function saveCurrentTab(fig, tg)
         uialert(fig, sprintf('Saved to:\n%s', outPath), 'Saved', 'Icon', 'success');
     catch ME
         uialert(fig, sprintf('Could not save: %s', ME.message), 'Save failed');
+    end
+end
+
+function saveAllTabs(fig, tg)
+    % Save every tab as one high-quality multi-page PDF.
+    %
+    % For each tab we briefly select it (so the layout is realised) and
+    % then append it to the output PDF with exportgraphics(..., 'Append',
+    % true), which produces vector output where possible. If the running
+    % MATLAB cannot append a uitab container to a PDF, we fall back to
+    % writing one PDF per tab into a sibling folder.
+    [file, path] = uiputfile({'*.pdf','PDF document (*.pdf)'}, ...
+        'Save all tabs as multi-page PDF', 'detection_results_all.pdf');
+    if isequal(file, 0), return; end
+    outPath = fullfile(path, file);
+    if isfile(outPath), delete(outPath); end
+
+    tabs    = tg.Children;
+    nTabs   = numel(tabs);
+    origTab = tg.SelectedTab;
+    progressDlg = uiprogressdlg(fig, 'Title', 'Saving PDF', ...
+        'Message', sprintf('Rendering tab 1 of %d...', nTabs), ...
+        'Cancelable', 'on');
+    restoreTab = onCleanup(@() restoreSelectedTab(tg, origTab)); %#ok<NASGU>
+    closeProg  = onCleanup(@() delete(progressDlg));              %#ok<NASGU>
+
+    appendOk = true;
+    try
+        for i = 1:nTabs
+            if progressDlg.CancelRequested, return; end
+            progressDlg.Value   = (i-1) / nTabs;
+            progressDlg.Message = sprintf('Rendering tab %d of %d: %s', ...
+                i, nTabs, tabs(i).Title);
+
+            tg.SelectedTab = tabs(i);
+            drawnow;
+
+            try
+                exportgraphics(tabs(i), outPath, ...
+                    'ContentType', 'vector', ...
+                    'Append',      i > 1);
+            catch
+                % Older MATLAB or unsupported container -> per-tab files.
+                appendOk = false;
+                break;
+            end
+        end
+
+        if appendOk
+            progressDlg.Value = 1;
+            uialert(fig, sprintf('Saved %d tabs to:\n%s', nTabs, outPath), ...
+                'Saved', 'Icon', 'success');
+            return;
+        end
+
+        % --- Fallback: render each tab via exportapp into a sibling folder
+        if isfile(outPath), delete(outPath); end
+        [outDir, base] = fileparts(outPath);
+        pagesDir = fullfile(outDir, [base '_pages']);
+        if ~isfolder(pagesDir), mkdir(pagesDir); end
+        for i = 1:nTabs
+            if progressDlg.CancelRequested, return; end
+            progressDlg.Value   = (i-1) / nTabs;
+            progressDlg.Message = sprintf('Fallback: rendering tab %d of %d', i, nTabs);
+            tg.SelectedTab = tabs(i);
+            drawnow;
+            safeTitle = matlab.lang.makeValidName(tabs(i).Title);
+            dst = fullfile(pagesDir, sprintf('%02d_%s.pdf', i, safeTitle));
+            exportapp(tabs(i), dst);
+        end
+        uialert(fig, sprintf(['Multi-page PDF append not supported here.\n' ...
+            'Saved %d individual tab PDFs in:\n%s'], nTabs, pagesDir), ...
+            'Saved (per-tab)', 'Icon', 'warning');
+    catch ME
+        uialert(fig, sprintf('Could not save: %s', ME.message), 'Save failed');
+    end
+end
+
+function restoreSelectedTab(tg, tab)
+    try
+        tg.SelectedTab = tab;
+    catch
+        % ignore -- figure may already be closed
     end
 end
 
