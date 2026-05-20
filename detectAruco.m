@@ -32,6 +32,15 @@ if ~isfield(params,'useParallel'),  params.useParallel  = true;  end
 if ~isfield(params,'numCells'),     params.numCells     = 8;     end
 if ~isfield(params,'codeSize'),     params.codeSize     = 6;     end
 if ~isfield(params,'cellPx'),       params.cellPx       = 20;    end
+if ~isfield(params,'requestedMarkerIds'), params.requestedMarkerIds = []; end
+
+% Normalise requested marker IDs into a sorted int32 row vector.
+requestedMarkerIds = int32(params.requestedMarkerIds(:)');
+if isempty(requestedMarkerIds)
+    fprintf('Requested markers: ANY (no filter)\n');
+else
+    fprintf('Requested markers: %s\n', mat2str(requestedMarkerIds));
+end
 
 windowDurations_ms = params.windowDurations_ms;
 windowDurations_us = windowDurations_ms * 1000;
@@ -165,7 +174,7 @@ if hasParallel
                 mid = decodeMarker_local( ...
                     warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
 
-                if mid >= 0
+                if mid >= 0 && (isempty(requestedMarkerIds) || any(requestedMarkerIds == int32(mid)))
                     bestID = mid;
                     break;
                 end
@@ -228,7 +237,7 @@ else
                 mid = decodeMarker_local( ...
                     warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
 
-                if mid >= 0
+                if mid >= 0 && (isempty(requestedMarkerIds) || any(requestedMarkerIds == int32(mid)))
                     bestID = mid;
                     break;
                 end
@@ -328,6 +337,7 @@ for wi = 1:numWindows
 end
 results.windowDurations_ms = windowDurations_ms;
 results.detectionsPerWindow = detectionsPerWindow;
+results.requestedMarkerIds  = double(requestedMarkerIds);
 
 end
 

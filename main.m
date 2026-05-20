@@ -28,6 +28,12 @@ params.tickStep_us        = 1000;       % 1 ms tick step
 params.showVis            = false;
 params.useParallel        = true;       % true = use parfor if toolbox is available; false = always sequential
 
+% Which ArUco IDs are we hunting for?
+%   []          -> accept ANY decoded marker
+%   3           -> only count detections of marker id 3
+%   [3 7 12]    -> accept any of these IDs
+params.requestedMarkerIds = 3;
+
 % Marker grid (ARUCO_MIP_36h12: 8x8 grid, 6x6 inner code)
 params.numCells = 8;
 params.codeSize = 6;

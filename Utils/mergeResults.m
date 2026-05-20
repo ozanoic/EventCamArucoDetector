@@ -137,6 +137,15 @@ for wi = 1:numWindows
 end
 merged.attemptedPerWindow = attempted;
 
+% Carry the requested-marker-IDs through (union across files, if present)
+reqSet = [];
+for k = 1:length(allData)
+    if isfield(allData{k}, 'requestedMarkerIds')
+        reqSet = union(reqSet, double(allData{k}.requestedMarkerIds(:)'));
+    end
+end
+merged.requestedMarkerIds = reqSet;
+
 %% ---- Summary ----
 nAny = sum(merged.anyDetected);
 fprintf('\n--- Merged Summary ---\n');

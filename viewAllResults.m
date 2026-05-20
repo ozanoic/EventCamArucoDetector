@@ -63,34 +63,41 @@ figGL.RowHeight   = {32, '1x'};
 figGL.Padding     = [4 4 4 4];
 figGL.RowSpacing  = 4;
 
-% --- Toolbar (save current tab / full window / all tabs) ---
-tb = uigridlayout(figGL, [1 4]);
+% --- Toolbar (marker filter + save buttons) ---
+tb = uigridlayout(figGL, [1 6]);
 tb.Layout.Row     = 1;
-tb.ColumnWidth    = {160, 170, 190, '1x'};
+tb.ColumnWidth    = {65, 130, 160, 170, 215, '1x'};
 tb.Padding        = [0 0 0 0];
 tb.ColumnSpacing  = 6;
-btnTab = uibutton(tb, 'Text', 'Save Current Tab (PDF)...', ...
-    'ButtonPushedFcn', @(~,~) saveCurrentTab(fig, tg));
-btnTab.Layout.Column = 1;
-btnAll = uibutton(tb, 'Text', 'Save Whole Window (PDF)...', ...
-    'ButtonPushedFcn', @(~,~) saveWholeWindow(fig));
-btnAll.Layout.Column = 2;
-btnEvery = uibutton(tb, 'Text', 'Save All Tabs (multi-page PDF)...', ...
-    'ButtonPushedFcn', @(~,~) saveAllTabs(fig, tg));
-btnEvery.Layout.Column = 3;
 
+% Discover every marker id any window ever decoded into.
+markerIds = discoverMarkerIds(datasets);
+
+% Tabgroup is created first so save-button closures can capture it.
 tg = uitabgroup(figGL);
 tg.Layout.Row = 2;
 
-%% ---- Tab 1: Summary ----
-summaryTab = uitab(tg, 'Title', 'Summary');
-buildSummaryTab(summaryTab, datasets);
+lblMarker = uilabel(tb, 'Text', 'Marker:', 'HorizontalAlignment', 'right');
+lblMarker.Layout.Column = 1;
+markerItems    = ['All markers', arrayfun(@(x) sprintf('ID %d', x), markerIds, ...
+                                          'UniformOutput', false)];
+markerItemData = [{[]}, num2cell(markerIds)];
+ddMarker = uidropdown(tb, 'Items', markerItems, 'ItemsData', markerItemData);
+ddMarker.Layout.Column = 2;
 
-%% ---- Tabs 2..N: Per-dataset details ----
-for i = 1:length(datasets)
-    tab = uitab(tg, 'Title', shortenName(datasets(i).name));
-    buildDetailTab(tab, datasets(i));
-end
+btnTab = uibutton(tb, 'Text', 'Save Current Tab (PDF)...', ...
+    'ButtonPushedFcn', @(~,~) saveCurrentTab(fig, tg));
+btnTab.Layout.Column = 3;
+btnAll = uibutton(tb, 'Text', 'Save Whole Window (PDF)...', ...
+    'ButtonPushedFcn', @(~,~) saveWholeWindow(fig));
+btnAll.Layout.Column = 4;
+btnEvery = uibutton(tb, 'Text', 'Save All Tabs (multi-page PDF)...', ...
+    'ButtonPushedFcn', @(~,~) saveAllTabs(fig, tg));
+btnEvery.Layout.Column = 5;
+
+% (Re)build every tab for the currently selected marker filter.
+ddMarker.ValueChangedFcn = @(~,~) buildAllTabs(tg, datasets, ddMarker.Value);
+buildAllTabs(tg, datasets, ddMarker.Value);   % initial build
 
 fprintf('\nOpened window with %d tabs (1 summary + %d datasets).\n', ...
     1 + length(datasets), length(datasets));
@@ -98,9 +105,64 @@ end
 
 
 %% =========================================================================
+%                       BUILD / REBUILD ALL TABS
+%% =========================================================================
+function buildAllTabs(tg, datasets, markerFilter)
+    % markerFilter: [] -> all markers; otherwise scalar marker ID.
+    delete(tg.Children);
+    titleSuffix = markerLabelSuffix(markerFilter);
+
+    summaryTab = uitab(tg, 'Title', ['Summary' titleSuffix]);
+    buildSummaryTab(summaryTab, datasets, markerFilter);
+
+    for i = 1:length(datasets)
+        tab = uitab(tg, 'Title', shortenName(datasets(i).name));
+        buildDetailTab(tab, datasets(i), markerFilter);
+    end
+end
+
+function s = markerLabelSuffix(markerFilter)
+    if isempty(markerFilter)
+        s = '';
+    else
+        s = sprintf(' (ID %d)', markerFilter);
+    end
+end
+
+function ids = discoverMarkerIds(datasets)
+    % Scan every win_*ms column across every dataset and return the sorted
+    % unique set of marker IDs that were actually decoded (>= 0).
+    seen = [];
+    for i = 1:length(datasets)
+        d = datasets(i).data;
+        if ~isfield(d, 'windowDurations_ms'), continue; end
+        wins = double(d.windowDurations_ms);
+        for wi = 1:length(wins)
+            col = d.(sprintf('win_%dms', wins(wi)));
+            v = double(col(col >= 0));
+            if ~isempty(v), seen = [seen; v]; end %#ok<AGROW>
+        end
+    end
+    ids = unique(seen(:))';
+end
+
+function mask = detectionMaskForMarker(colVec, markerFilter)
+    % Returns a logical column the same length as colVec:
+    %   markerFilter == []      -> col >= 0          (any marker)
+    %   markerFilter == <id>    -> col == markerFilter (that marker only)
+    if isempty(markerFilter)
+        mask = colVec(:) >= 0;
+    else
+        mask = colVec(:) == markerFilter;
+    end
+end
+
+
+%% =========================================================================
 %                       SUMMARY TAB
 %% =========================================================================
-function buildSummaryTab(parent, datasets)
+function buildSummaryTab(parent, datasets, markerFilter)
+    if nargin < 3, markerFilter = []; end
     n = length(datasets);
 
     % Build per-dataset summary rows
@@ -125,18 +187,24 @@ function buildSummaryTab(parent, datasets)
         d = datasets(i).data;
         nTicks = length(d.tNow_us);
         totalTicks(i) = nTicks;
-        overallRates(i) = 100 * sum(d.anyDetected > 0) / max(nTicks, 1);
 
+        % Any-window detection rate, filtered by marker
         wins = double(d.windowDurations_ms);
+        winMask = false(nTicks, length(wins));
+        for wi = 1:length(wins)
+            winMask(:, wi) = detectionMaskForMarker( ...
+                d.(sprintf('win_%dms', wins(wi))), markerFilter);
+        end
+        overallRates(i) = 100 * sum(any(winMask, 2)) / max(nTicks, 1);
+
         rates = zeros(size(wins));
         for wi = 1:length(wins)
-            col = d.(sprintf('win_%dms', wins(wi)));
             if isfield(d, 'attemptedPerWindow')
                 denom = d.attemptedPerWindow(wi);
             else
                 denom = nTicks;
             end
-            rates(wi) = 100 * sum(col >= 0) / max(denom, 1);
+            rates(wi) = 100 * sum(winMask(:, wi)) / max(denom, 1);
 
             [~, colIdx] = ismember(wins(wi), allWinMs);
             rateMat(i, colIdx) = rates(wi);
@@ -185,7 +253,12 @@ function buildSummaryTab(parent, datasets)
     end
 
     % --- Heatmap: dataset × window ---
-    hmPanel = uipanel(gl, 'Title', 'Detection Rate (%) -- Dataset × Window');
+    if isempty(markerFilter)
+        hmTitle = 'Detection Rate (%) -- Dataset × Window  (any marker)';
+    else
+        hmTitle = sprintf('Detection Rate (%%) -- Dataset × Window  (marker ID %d only)', markerFilter);
+    end
+    hmPanel = uipanel(gl, 'Title', hmTitle);
     hmPanel.Layout.Row = 2; hmPanel.Layout.Column = [1 2];
     hmGL = uigridlayout(hmPanel, [1 1]);
     hmGL.Padding = [5 5 5 5];
@@ -220,7 +293,8 @@ end
 %% =========================================================================
 %                       DETAIL TAB (per dataset)
 %% =========================================================================
-function buildDetailTab(parent, dataset)
+function buildDetailTab(parent, dataset, markerFilter)
+    if nargin < 3, markerFilter = []; end
     d = dataset.data;
     name = dataset.name;
 
@@ -229,19 +303,20 @@ function buildDetailTab(parent, dataset)
     nTicks = length(d.tNow_us);
     tSec = (double(d.tNow_us) - double(d.tNow_us(1))) / 1e6;
 
-    % Build detection matrix
+    % Build detection matrix (filtered by marker selection)
     detMat = false(nTicks, numWindows);
     for wi = 1:numWindows
-        detMat(:, wi) = d.(sprintf('win_%dms', winMs(wi))) >= 0;
+        detMat(:, wi) = detectionMaskForMarker( ...
+            d.(sprintf('win_%dms', winMs(wi))), markerFilter);
     end
-    anyDet = d.anyDetected > 0;
+    anyDet = any(detMat, 2);
 
     % Layout: header, raster, per-window bar
     gl = uigridlayout(parent, [3 1]);
     gl.RowHeight = {35, '1.2x', '1x'};
 
     % --- Header label with key stats ---
-    hdr = uilabel(gl, 'Text', buildHeaderText(name, d, anyDet, detMat, winMs), ...
+    hdr = uilabel(gl, 'Text', buildHeaderText(name, d, anyDet, detMat, winMs, markerFilter), ...
         'FontWeight', 'bold', 'FontSize', 11);
     hdr.Layout.Row = 1;
 
@@ -447,12 +522,13 @@ function restoreSelectedTab(tg, tab)
     end
 end
 
-function txt = buildHeaderText(name, d, anyDet, detMat, winMs)
+function txt = buildHeaderText(name, d, anyDet, detMat, winMs, markerFilter)
+    if nargin < 6, markerFilter = []; end
     nTicks = length(d.tNow_us);
     nAny = sum(anyDet);
     dur = (double(d.tNow_us(end)) - double(d.tNow_us(1))) / 1e6;
 
-    % Best window
+    % Best window (for this filter)
     rates = zeros(1, length(winMs));
     for wi = 1:length(winMs)
         if isfield(d, 'attemptedPerWindow')
@@ -464,8 +540,14 @@ function txt = buildHeaderText(name, d, anyDet, detMat, winMs)
     end
     [bestRate, bi] = max(rates);
 
-    txt = sprintf(['%s   |   %d ticks (%.2fs)   |   Any-window: %d (%.1f%%)   |   ' ...
+    if isempty(markerFilter)
+        filterStr = 'any marker';
+    else
+        filterStr = sprintf('marker ID %d', markerFilter);
+    end
+
+    txt = sprintf(['%s   |   %s   |   %d ticks (%.2fs)   |   Any-window: %d (%.1f%%)   |   ' ...
         'Best: %dms at %.1f%%   |   Windows: %s ms'], ...
-        name, nTicks, dur, nAny, 100*nAny/max(nTicks,1), ...
+        name, filterStr, nTicks, dur, nAny, 100*nAny/max(nTicks,1), ...
         winMs(bi), bestRate, mat2str(winMs));
 end
