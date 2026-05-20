@@ -7,23 +7,28 @@ function results = detectAruco(matFile, sensorSize, params)
 %    matFile    - path to .mat file containing 'events' (Nx4: x,y,pol,t)
 %    sensorSize - [height, width]
 %    params     - struct with fields:
-%      .windowDurations_ms  - vector of lookback windows in ms (e.g. [5 10 20 50 100])
-%      .tickStep_us         - tick step in microseconds (default 1000)
-%      .showVis             - enable per-tick visualization (default false)
-%      .useParallel         - true: use parfor if toolbox available (default);
-%                             false: force sequential execution
-%      .numCells            - marker grid size (default 8)
-%      .codeSize            - inner code grid size (default 6)
-%      .cellPx              - pixels per cell in unwarped image (default 20)
-%      .blobParams          - struct with .minArea, .maxArea, .maxAspect
+%      .windowDurations_ms   - vector of lookback windows in ms (e.g. [5 10 20 50 100])
+%      .tickStep_us          - tick step in microseconds (default 1000)
+%      .showVis              - enable per-tick visualization (default false)
+%      .useParallel          - true: use parfor if toolbox available (default);
+%                              false: force sequential execution
+%      .numCells             - marker grid size (default 8)
+%      .codeSize             - inner code grid size (default 6)
+%      .cellPx               - pixels per cell in unwarped image (default 20)
+%      .blobParams           - struct with .minArea, .maxArea, .maxAspect
+%      .requestedMarkerIds   - scalar or vector of ArUco IDs to accept
+%                              (default [] = accept any decoded marker).
+%                              Decodes whose ID is NOT in the set are
+%                              treated as no-detection for that tick/window.
 %
 %  Output:
 %    results - struct with fields:
 %      .tNow_us             - timestamps (us) for each tick
 %      .anyDetected         - 1 if any window detected a marker at that tick
-%      .win_Xms             - detected marker ID per window (-1 = none)
+%      .win_Xms             - detected marker ID per window (-1 = none / filtered out)
 %      .windowDurations_ms  - copy of window durations used
 %      .detectionsPerWindow - total detections per window
+%      .requestedMarkerIds  - echo of the filter that was applied (double row)
 
 %% ---- Default parameters ----
 if ~isfield(params,'tickStep_us'),  params.tickStep_us  = 1000;  end
