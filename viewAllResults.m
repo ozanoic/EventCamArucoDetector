@@ -157,6 +157,48 @@ function mask = detectionMaskForMarker(colVec, markerFilter)
     end
 end
 
+function ids = collectReportIds(datasets)
+    % Returns the set of marker IDs that should get their own column /
+    % series in the summary view. Prefers the canonical fields written
+    % by detectAruco/mergeResults; falls back to discoverMarkerIds.
+    reported = [];
+    requested = [];
+    for i = 1:length(datasets)
+        d = datasets(i).data;
+        if isfield(d, 'markerIdsReported')
+            reported = union(reported, double(d.markerIdsReported(:)'));
+        end
+        if isfield(d, 'requestedMarkerIds')
+            requested = union(requested, double(d.requestedMarkerIds(:)'));
+        end
+    end
+    if ~isempty(reported)
+        ids = sort(reported(:)');
+    elseif ~isempty(requested)
+        ids = sort(requested(:)');
+    else
+        ids = discoverMarkerIds(datasets);
+    end
+end
+
+function anyDet = perMarkerAnyDetect(d, mid)
+    % Returns an Nx1 logical: was marker `mid` decoded by ANY window at
+    % each tick? Prefers the precomputed anyDetected_idN field, falls
+    % back to scanning the win_*ms columns if it's not there.
+    fname = sprintf('anyDetected_id%d', mid);
+    if isfield(d, fname)
+        anyDet = d.(fname) > 0;
+        return;
+    end
+    nTicks = length(d.tNow_us);
+    anyDet = false(nTicks, 1);
+    wins = double(d.windowDurations_ms);
+    for wi = 1:length(wins)
+        col = d.(sprintf('win_%dms', wins(wi)));
+        anyDet = anyDet | (col(:) == mid);
+    end
+end
+
 
 %% =========================================================================
 %                       SUMMARY TAB
@@ -182,6 +224,16 @@ function buildSummaryTab(parent, datasets, markerFilter)
     allWinMs = sort(allWinMs);
 
     rateMat = nan(n, length(allWinMs));  % per-dataset × per-window rate (%)
+
+    % Discover the set of "interesting" marker IDs so we can show one
+    % column per marker in the summary table.  Preference order:
+    %   (1) markerIdsReported (set by detectAruco/mergeResults), if every
+    %       dataset has it - that's the canonical answer.
+    %   (2) requestedMarkerIds union across datasets.
+    %   (3) every ID actually decoded in the data.
+    perMarkerIds = collectReportIds(datasets);
+
+    perMarkerPct = nan(n, length(perMarkerIds));
 
     for i = 1:n
         d = datasets(i).data;
@@ -212,6 +264,13 @@ function buildSummaryTab(parent, datasets, markerFilter)
 
         [bestRate(i), bi] = max(rates);
         bestWin{i} = sprintf('%dms', wins(bi));
+
+        % Per-marker any-detect % (independent of the dropdown filter)
+        for mi = 1:length(perMarkerIds)
+            mid = perMarkerIds(mi);
+            anyForId = perMarkerAnyDetect(d, mid);
+            perMarkerPct(i, mi) = 100 * sum(anyForId) / max(nTicks, 1);
+        end
     end
 
     % ---- Layout: table on top-left, bars on top-right, heatmap below ----
@@ -223,34 +282,55 @@ function buildSummaryTab(parent, datasets, markerFilter)
     tblPanel = uipanel(gl, 'Title', 'Per-Dataset Summary');
     tblPanel.Layout.Row = 1; tblPanel.Layout.Column = 1;
 
-    T = table(names, totalTicks, round(overallRates, 2), bestWin, round(bestRate, 2), ...
-        'VariableNames', {'Dataset', 'Ticks', 'AnyDetectPct', 'BestWindow', 'BestRatePct'});
+    varNames = {'Dataset', 'Ticks', 'AnyDetectPct', 'BestWindow', 'BestRatePct'};
+    tableCols = {names, totalTicks, round(overallRates, 2), bestWin, round(bestRate, 2)};
+    for mi = 1:length(perMarkerIds)
+        varNames{end+1} = sprintf('Id%dPct', perMarkerIds(mi)); %#ok<AGROW>
+        tableCols{end+1} = round(perMarkerPct(:, mi), 2);       %#ok<AGROW>
+    end
+    T = table(tableCols{:}, 'VariableNames', varNames);
     uit = uitable(tblPanel, 'Data', T, 'Units', 'normalized', 'Position', [0 0 1 1]);
-    uit.ColumnSortable = true(1, 5);
+    uit.ColumnSortable = true(1, width(T));
 
-    % --- Overall detection bar chart ---
+    % --- Overall detection bar chart -----------------------------------
+    % If there are multiple reported markers, draw one grouped bar per
+    % marker so you can read e.g. "marker 3 vs marker 8" side-by-side
+    % at a glance. Otherwise fall back to the simple one-bar-per-dataset
+    % view.
     barPanel = uipanel(gl, 'Title', 'Overall Detection Rate per Dataset');
     barPanel.Layout.Row = 1; barPanel.Layout.Column = 2;
     barGL = uigridlayout(barPanel, [1 1]);
     barGL.Padding = [5 5 5 5];
     ax1 = uiaxes(barGL);
-    b = bar(ax1, 1:n, overallRates);
-    b.FaceColor = 'flat';
-    cmap = turbo(n);
-    for i = 1:n
-        b.CData(i,:) = cmap(i,:);
+
+    if length(perMarkerIds) >= 2 && isempty(markerFilter)
+        % Grouped bars: rows = datasets, columns = markers
+        b = bar(ax1, 1:n, perMarkerPct, 'grouped');
+        legendLabels = arrayfun(@(x) sprintf('ID %d', x), perMarkerIds, ...
+                                'UniformOutput', false);
+        legend(ax1, legendLabels, 'Location', 'best');
+        title(ax1, 'Any-window detection rate per marker');
+    else
+        b = bar(ax1, 1:n, overallRates);
+        b.FaceColor = 'flat';
+        cmap = turbo(n);
+        for i = 1:n, b.CData(i,:) = cmap(i,:); end
+        if isempty(markerFilter)
+            title(ax1, 'Any-window detection rate');
+        else
+            title(ax1, sprintf('Any-window detection rate (marker ID %d)', markerFilter));
+        end
+        for i = 1:n
+            text(ax1, i, overallRates(i) + 1.5, sprintf('%.1f%%', overallRates(i)), ...
+                'HorizontalAlignment', 'center', 'FontSize', 8);
+        end
     end
     ax1.XTick = 1:n;
     ax1.XTickLabel = cellfun(@shortenName, names, 'UniformOutput', false);
     ax1.XTickLabelRotation = 35;
     ylabel(ax1, 'Detection Rate (%)');
-    title(ax1, 'Any-window detection rate');
     ylim(ax1, [0 105]);
     grid(ax1, 'on');
-    for i = 1:n
-        text(ax1, i, overallRates(i) + 1.5, sprintf('%.1f%%', overallRates(i)), ...
-            'HorizontalAlignment', 'center', 'FontSize', 8);
-    end
 
     % --- Heatmap: dataset × window ---
     if isempty(markerFilter)

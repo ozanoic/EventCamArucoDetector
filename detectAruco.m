@@ -332,7 +332,7 @@ fprintf('Ticks with detection:    %d (%.1f%%)\n', ...
     ticksWithAnyDetection, 100*ticksWithAnyDetection/max(numTicks,1));
 fprintf('Total detections:        %d (across all windows)\n', totalDetections);
 fprintf('Elapsed time:            %.1fs\n', elapsed);
-fprintf('\n--- Per-window breakdown ---\n');
+fprintf('\n--- Per-window breakdown (all markers combined) ---\n');
 fprintf('%-10s  %10s  %10s\n', 'Window', 'Detections', 'Rate');
 fprintf('%-10s  %10s  %10s\n', '------', '----------', '----');
 for wi = 1:numWindows
@@ -340,6 +340,54 @@ for wi = 1:numWindows
         sprintf('%dms', windowDurations_ms(wi)), ...
         detectionsPerWindow(wi), ...
         100 * detectionsPerWindow(wi) / max(numTicks, 1));
+end
+
+%% ---- Per-marker breakdown ----
+% If the user is hunting for specific IDs, also report each one separately
+% so you can see how the algorithm performs on marker 3 vs marker 8 vs ...
+% When no filter is set, we instead break down by every ID that was
+% actually decoded.
+winColsAll = resultTable(:, 3:end);    % numTicks x numWindows
+if ~isempty(requestedMarkerIds)
+    reportIds = double(requestedMarkerIds);
+else
+    reportIds = unique(winColsAll(winColsAll >= 0))';
+end
+
+perMarker = struct();   % filled below, also written into results
+if ~isempty(reportIds)
+    fprintf('\n--- Per-marker breakdown ---\n');
+    fprintf('%-8s  %8s  %12s  %8s\n', 'Marker', 'AnyHit', 'AnyHit %', 'TotalHit');
+    fprintf('%-8s  %8s  %12s  %8s\n', '------', '------', '--------', '--------');
+    for ri = 1:length(reportIds)
+        mid = reportIds(ri);
+        hits = winColsAll == double(mid);            % numTicks x numWindows logical
+        anyForId = any(hits, 2);
+        countPerWin = sum(hits, 1);
+        nAny  = sum(anyForId);
+        nHit  = sum(countPerWin);
+        fprintf('id=%-4d   %8d   %11.1f%%  %8d\n', ...
+            mid, nAny, 100*nAny/max(numTicks,1), nHit);
+        perMarker(ri).id                  = mid;
+        perMarker(ri).anyDetected         = double(anyForId);
+        perMarker(ri).detectionsPerWindow = countPerWin;
+    end
+
+    % Also a per-window table showing how each marker fares per window
+    fprintf('\n--- Per-window, per-marker detection counts ---\n');
+    hdr = sprintf('%-10s', 'Window');
+    for ri = 1:length(reportIds)
+        hdr = [hdr sprintf('  %10s', sprintf('id=%d', reportIds(ri)))]; %#ok<AGROW>
+    end
+    fprintf('%s\n', hdr);
+    fprintf('%s\n', repmat('-', 1, length(hdr)));
+    for wi = 1:numWindows
+        row = sprintf('%-10s', sprintf('%dms', windowDurations_ms(wi)));
+        for ri = 1:length(reportIds)
+            row = [row sprintf('  %10d', perMarker(ri).detectionsPerWindow(wi))]; %#ok<AGROW>
+        end
+        fprintf('%s\n', row);
+    end
 end
 fprintf('========================================\n');
 
@@ -353,6 +401,18 @@ end
 results.windowDurations_ms = windowDurations_ms;
 results.detectionsPerWindow = detectionsPerWindow;
 results.requestedMarkerIds  = double(requestedMarkerIds);
+
+% Per-marker fields. One pair of fields per reported ID:
+%   anyDetected_id<N>         : Nx1 double (0/1) -- any window saw marker N
+%   detectionsPerWindow_id<N> : 1xW double       -- per-window counts for N
+results.markerIdsReported = reportIds;
+for ri = 1:length(reportIds)
+    mid = reportIds(ri);
+    fname_any = sprintf('anyDetected_id%d', mid);
+    fname_cnt = sprintf('detectionsPerWindow_id%d', mid);
+    results.(fname_any) = perMarker(ri).anyDetected;
+    results.(fname_cnt) = perMarker(ri).detectionsPerWindow;
+end
 
 end
 

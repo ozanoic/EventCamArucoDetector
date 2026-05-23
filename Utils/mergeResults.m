@@ -146,6 +146,23 @@ for k = 1:length(allData)
 end
 merged.requestedMarkerIds = reqSet;
 
+% Recompute per-marker fields from the merged win_*ms columns.
+% Report IDs = requested set if any, otherwise every ID that actually
+% appears in the merged data.
+if ~isempty(reqSet)
+    reportIds = reqSet;
+else
+    vals = winMatrix(winMatrix >= 0);
+    reportIds = unique(vals)';
+end
+merged.markerIdsReported = reportIds;
+for ri = 1:length(reportIds)
+    mid = reportIds(ri);
+    hits = winMatrix == mid;
+    merged.(sprintf('anyDetected_id%d', mid))         = double(any(hits, 2));
+    merged.(sprintf('detectionsPerWindow_id%d', mid)) = sum(hits, 1);
+end
+
 %% ---- Summary ----
 nAny = sum(merged.anyDetected);
 fprintf('\n--- Merged Summary ---\n');
