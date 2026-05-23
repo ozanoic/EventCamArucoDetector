@@ -20,6 +20,19 @@ function results = detectAruco(matFile, sensorSize, params)
 %                              (default [] = accept any decoded marker).
 %                              Decodes whose ID is NOT in the set are
 %                              treated as no-detection for that tick/window.
+%      .earlyExitOnFirstHit  - true: stop a tick's window loop after the
+%                              first successful decode (faster, but the
+%                              per-window detection breakdown is no longer
+%                              meaningful). Default false.
+%      .detectScale          - scalar in (0, 1] (default 1). When < 1, blob
+%                              detection runs on a downscaled mask; quad
+%                              corners are scaled back up before the warp.
+%                              0.5 is roughly 4x faster on the blob stage
+%                              at the cost of ~1 px corner accuracy.
+%      .useGPU               - true: push the per-quad imwarp to GPU via
+%                              gpuArray (forces sequential mode because
+%                              the GPU cannot be shared across parfor
+%                              workers efficiently). Default false.
 %
 %  Output:
 %    results - struct with fields:
@@ -37,7 +50,10 @@ if ~isfield(params,'useParallel'),  params.useParallel  = true;  end
 if ~isfield(params,'numCells'),     params.numCells     = 8;     end
 if ~isfield(params,'codeSize'),     params.codeSize     = 6;     end
 if ~isfield(params,'cellPx'),       params.cellPx       = 20;    end
-if ~isfield(params,'requestedMarkerIds'), params.requestedMarkerIds = []; end
+if ~isfield(params,'requestedMarkerIds'),   params.requestedMarkerIds   = []; end
+if ~isfield(params,'earlyExitOnFirstHit'),  params.earlyExitOnFirstHit  = false; end
+if ~isfield(params,'detectScale'),          params.detectScale          = 1.0;  end
+if ~isfield(params,'useGPU'),               params.useGPU               = false; end
 
 % Normalise requested marker IDs into a sorted int32 row vector.
 requestedMarkerIds = int32(params.requestedMarkerIds(:)');
@@ -113,8 +129,37 @@ end
 resultTable = zeros(numTicks, 2 + numWindows);
 detectionsPerWindow = zeros(1, numWindows);
 
-blobParams = params.blobParams;
-showVis = params.showVis;
+blobParams        = params.blobParams;
+showVis           = params.showVis;
+earlyExitOnHit    = logical(params.earlyExitOnFirstHit);
+detectScale       = params.detectScale;
+useGPU            = logical(params.useGPU);
+
+if detectScale <= 0 || detectScale > 1
+    error('detectAruco: params.detectScale must be in (0, 1]; got %g.', detectScale);
+end
+if useGPU && hasParallel
+    fprintf('useGPU=TRUE  but useParallel=TRUE -> forcing sequential (GPU is shared per process).\n');
+    hasParallel = false;
+end
+if useGPU
+    try
+        gd = gpuDevice;
+        fprintf('GPU enabled: %s (CUDA %d.%d, %.1f GB)\n', gd.Name, ...
+            gd.ComputeCapabilityMajor, gd.ComputeCapabilityMinor, ...
+            gd.AvailableMemory / 1e9);
+    catch
+        fprintf('useGPU=TRUE but no usable GPU found -> falling back to CPU.\n');
+        useGPU = false;
+    end
+end
+if detectScale < 1
+    fprintf('detectScale = %.2f  ->  blob stage at %dx%d, corners refined to %dx%d\n', ...
+        detectScale, round(W*detectScale), round(H*detectScale), W, H);
+end
+if earlyExitOnHit
+    fprintf('earlyExitOnFirstHit = TRUE  ->  per-tick window loop stops at first decode\n');
+end
 
 if showVis
     hFig = figure('Name', 'Multi-Window Detection', 'Position', [30 30 1800 900]);
@@ -145,47 +190,19 @@ if hasParallel
         tickRow = -1 * ones(1, numWindows);
 
         for wi = 1:numWindows
-            dt = windowDurations_us(wi);
-            tFrom = tNow - dt;
-
-            iStart = bsearchLeft(evT, tFrom);
-            iEnd   = bsearchRight(evT, tNow);
-
-            nEv = iEnd - iStart + 1;
-            if nEv < 10, continue; end
-
-            wX = evX(iStart:iEnd);
-            wY = evY(iStart:iEnd);
-
-            validMask = (wY >= 1) & (wY <= H) & (wX >= 1) & (wX <= W);
-            wXv = wX(validMask);
-            wYv = wY(validMask);
-            if isempty(wXv), continue; end
-
-            countImg = accumarray([wYv, wXv], 1, [H, W]);
-            activeMask = countImg > 0;
-
-            quads = detectQuadBlob(activeMask, blobParams);
-            if isempty(quads), continue; end
-
-            countU8 = uint8(countImg / max(countImg(:)) * 255);
-            bestID = -1;
-
-            for qi = 1:length(quads)
-                corners = orderCornersForUnwarp_local(quads{qi});
-                warpedImg = unwarpQuad_local(countU8, corners, markerCoords, sideSize);
-                if isempty(warpedImg), continue; end
-
-                mid = decodeMarker_local( ...
-                    warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
-
-                if mid >= 0 && (isempty(requestedMarkerIds) || any(requestedMarkerIds == int32(mid)))
-                    bestID = mid;
-                    break;
-                end
-            end
+            bestID = processWindow_local( ...
+                tNow, windowDurations_us(wi), ...
+                evT, evX, evY, H, W, ...
+                blobParams, detectScale, useGPU, ...
+                markerCoords, sideSize, ...
+                numCells, codeSize, cellPx, ...
+                dictCodes, dictIDs, requestedMarkerIds);
 
             tickRow(wi) = bestID;
+
+            if earlyExitOnHit && bestID >= 0
+                break;     % skip the remaining windows for this tick
+            end
         end
 
         anyDet = double(any(tickRow >= 0));
@@ -208,49 +225,20 @@ else
         tickRow = -1 * ones(1, numWindows);
 
         for wi = 1:numWindows
-            dt = windowDurations_us(wi);
-            tFrom = tNow - dt;
-
-            iStart = bsearchLeft(evT, tFrom);
-            iEnd   = bsearchRight(evT, tNow);
-
-            nEv = iEnd - iStart + 1;
-            if nEv < 10, continue; end
-
-            wX = evX(iStart:iEnd);
-            wY = evY(iStart:iEnd);
-
-            validMask = (wY >= 1) & (wY <= H) & (wX >= 1) & (wX <= W);
-            wXv = wX(validMask);
-            wYv = wY(validMask);
-            if isempty(wXv), continue; end
-
-            countImg = accumarray([wYv, wXv], 1, [H, W]);
-            activeMask = countImg > 0;
-
-            quads = detectQuadBlob(activeMask, blobParams);
-            if isempty(quads), continue; end
-
-            countU8 = uint8(countImg / max(countImg(:)) * 255);
-            bestID = -1;
-
-            for qi = 1:length(quads)
-                corners = orderCornersForUnwarp_local(quads{qi});
-                warpedImg = unwarpQuad_local(countU8, corners, markerCoords, sideSize);
-                if isempty(warpedImg), continue; end
-
-                mid = decodeMarker_local( ...
-                    warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
-
-                if mid >= 0 && (isempty(requestedMarkerIds) || any(requestedMarkerIds == int32(mid)))
-                    bestID = mid;
-                    break;
-                end
-            end
+            bestID = processWindow_local( ...
+                tNow, windowDurations_us(wi), ...
+                evT, evX, evY, H, W, ...
+                blobParams, detectScale, useGPU, ...
+                markerCoords, sideSize, ...
+                numCells, codeSize, cellPx, ...
+                dictCodes, dictIDs, requestedMarkerIds);
 
             tickRow(wi) = bestID;
             if bestID >= 0
                 detectionsPerWindow(wi) = detectionsPerWindow(wi) + 1;
+                if earlyExitOnHit
+                    break;
+                end
             end
         end
 
@@ -394,6 +382,92 @@ function out = ternary(cond, a, b)
     if cond, out = a; else, out = b; end
 end
 
+function bestID = processWindow_local( ...
+        tNow, dt, evT, evX, evY, H, W, ...
+        blobParams, detectScale, useGPU, ...
+        markerCoords, sideSize, ...
+        numCells, codeSize, cellPx, ...
+        dictCodes, dictIDs, requestedMarkerIds)
+    % Full per-window pipeline: slice events -> count image -> blob detect
+    % -> per-quad unwarp -> decode. Returns the decoded marker ID, or -1.
+
+    bestID = -1;
+
+    tFrom = tNow - dt;
+    iStart = bsearchLeft(evT, tFrom);
+    iEnd   = bsearchRight(evT, tNow);
+    nEv = iEnd - iStart + 1;
+    if nEv < 10, return; end
+
+    wX = evX(iStart:iEnd);
+    wY = evY(iStart:iEnd);
+    validMask = (wY >= 1) & (wY <= H) & (wX >= 1) & (wX <= W);
+    wXv = wX(validMask);
+    wYv = wY(validMask);
+    if isempty(wXv), return; end
+
+    % --- Always build the full-resolution count image (used for decoding) ---
+    countImg = accumarray([wYv, wXv], 1, [H, W]);
+
+    % --- Blob detection mask: full res, or downscaled when detectScale<1 ---
+    if detectScale < 1
+        sH = max(8, round(H * detectScale));
+        sW = max(8, round(W * detectScale));
+        smallMask = imresize(countImg, [sH sW], 'nearest') > 0;
+        % adjust blob area thresholds to the downscaled image
+        scaledParams = blobParams;
+        scaleArea = detectScale^2;
+        scaledParams.minArea = blobParams.minArea * scaleArea;
+        scaledParams.maxArea = blobParams.maxArea * scaleArea;
+        quadsSmall = detectQuadBlob(smallMask, scaledParams);
+        if isempty(quadsSmall), return; end
+        % Scale corners back to full resolution
+        invScale = 1 / detectScale;
+        quads = cell(1, length(quadsSmall));
+        for qi = 1:length(quadsSmall)
+            quads{qi} = quadsSmall{qi} * invScale;
+        end
+    else
+        activeMask = countImg > 0;
+        quads = detectQuadBlob(activeMask, blobParams);
+        if isempty(quads), return; end
+    end
+
+    countU8 = uint8(countImg / max(countImg(:)) * 255);
+
+    % --- Optional GPU offload of the per-quad warps -------------------
+    % imwarp is the dominant per-quad cost; pushing the source image to
+    % the GPU once and running all warps there saves the warp time on
+    % large sensors (e.g. 480x640) when several quads survive blob
+    % filtering. We gather only the small 160x160 warped tile.
+    countSrc = countU8;
+    if useGPU
+        try
+            countSrc = gpuArray(countU8);
+        catch
+            % keep CPU on any failure
+            countSrc = countU8;
+        end
+    end
+
+    for qi = 1:length(quads)
+        corners = orderCornersForUnwarp_local(quads{qi});
+        warpedImg = unwarpQuad_local(countSrc, corners, markerCoords, sideSize);
+        if isempty(warpedImg), continue; end
+        if isa(warpedImg, 'gpuArray')
+            warpedImg = gather(warpedImg);
+        end
+
+        mid = decodeMarker_local( ...
+            warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
+
+        if mid >= 0 && (isempty(requestedMarkerIds) || any(requestedMarkerIds == int32(mid)))
+            bestID = mid;
+            return;
+        end
+    end
+end
+
 function corners = orderCornersForUnwarp_local(corners)
     centroid = mean(corners, 1);
     angles = atan2(corners(:,2)-centroid(2), corners(:,1)-centroid(1));
@@ -509,7 +583,27 @@ function markerID = decodeMarker_local( ...
 
     for ci = 1:length(candidates)
         codeImg = candidates{ci};
-        for inv = [0, 1]
+
+        % --- Border-uniformity gate (cheap kill-switch for noise) -------
+        % ARUCO_MIP_36h12 markers have a 1-cell-thick uniform border.
+        % The outer ring is invariant under rotation and horizontal flip,
+        % so we can check it ONCE per candidate (before trying any of the
+        % 16 inv/flip/rot variants).
+        %   * all 0 -> canonical orientation, only try inv=0
+        %   * all 1 -> inverted orientation,  only try inv=1
+        %   * mixed -> not a marker, skip the candidate entirely
+        border = [codeImg(1, :), codeImg(end, :), ...
+                  codeImg(2:end-1, 1)', codeImg(2:end-1, end)'];
+        bSum = sum(border);
+        if bSum == 0
+            invList = 0;
+        elseif bSum == numel(border)
+            invList = 1;
+        else
+            continue;        % border not uniform -- noise, skip 16 variants
+        end
+
+        for inv = invList
             if inv == 1
                 testCode = 1 - codeImg;
             else
