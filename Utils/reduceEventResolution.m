@@ -4,32 +4,38 @@ function outPath = reduceEventResolution(matFile, scale, opts)
 %  outPath = reduceEventResolution(matFile)             % scale = 2, show = true
 %  outPath = reduceEventResolution(matFile, scale)
 %  outPath = reduceEventResolution(matFile, scale, opts)
+%  outPaths = reduceEventResolution(["a.mat","b.mat"], ...)    % batch
 %
 %  Loads `events` from matFile (Nx4 -- x, y, polarity, timestamp),
 %  downsamples the (x, y) coordinates by an integer factor `scale`
 %  (default 2), and saves a sibling .mat file named `<name>_reduced.mat`.
-%  Other variables in the source file are preserved as-is.
+%  Other variables in the source file are preserved as-is. The save uses
+%  MAT v7.3 so the events array can exceed 2 GB (older MAT versions
+%  silently truncate such variables, which writes a near-empty file).
 %
 %  Optionally shows a side-by-side comparison: original sensor resolution
 %  on top, reduced resolution on the bottom, several time slices across
 %  the recording, each accumulating a configurable window (default 10 ms).
 %
 %  Inputs:
-%    matFile : path to a .mat with an `events` (Nx4) variable
+%    matFile : path (string or char), OR string/cell array of paths
+%              (each is processed and saved to its own sibling).
 %    scale   : positive integer downscale factor (default 2)
 %    opts    : optional struct with fields
 %        .show       (default true)        show the side-by-side figure
 %        .windowMs   (default 10)          accumulation window per slice (ms)
 %        .numFrames  (default 6)           how many time slices to draw
-%        .outPath    (default '')          explicit output path
+%        .outPath    (default '')          explicit output path (single file only)
 %        .origSize   (default inferred)    [H W] of source sensor
 %
 %  Output:
 %    outPath : path to the saved <name>_reduced.mat
+%              (cell array when matFile is an array).
 %
-%  Example:
+%  Examples:
 %    reduceEventResolution('Data/OzanEventData_22.05.2026/1/1.mat');
-%    reduceEventResolution('Data/.../1.mat', 2, struct('windowMs', 20, 'numFrames', 8));
+%    reduceEventResolution(["Data/.../1.mat","Data/.../2.mat"], 2, ...
+%                          struct('show', false));   % batch, no figure
 
 if nargin < 2 || isempty(scale), scale = 2;           end
 if nargin < 3,                   opts  = struct();    end
@@ -38,6 +44,23 @@ if ~isfield(opts,'windowMs'),    opts.windowMs  = 10;   end
 if ~isfield(opts,'numFrames'),   opts.numFrames = 6;    end
 if ~isfield(opts,'outPath'),     opts.outPath   = '';   end
 if ~isfield(opts,'origSize'),    opts.origSize  = [];   end
+
+% -- Batch dispatch: if the caller passes more than one path, loop. --
+matFile = string(matFile);
+matFile = matFile(:);                  % column vector of strings
+if numel(matFile) > 1
+    if ~isempty(opts.outPath)
+        error('reduceEventResolution: opts.outPath is only valid for a single input.');
+    end
+    outPath = strings(numel(matFile), 1);
+    for k = 1:numel(matFile)
+        fprintf('\n=== [%d/%d] %s ===\n', k, numel(matFile), matFile(k));
+        outPath(k) = reduceEventResolution(matFile(k), scale, opts);
+    end
+    outPath = cellstr(outPath);
+    return;
+end
+matFile = char(matFile);               % single path from here on
 
 if ~isfile(matFile)
     error('reduceEventResolution: file not found: %s', matFile);
@@ -98,8 +121,25 @@ allVars.reduction = struct( ...
     'newSize',   [newH  newW], ...
     'sourceFile', matFile, ...
     'createdAt', datestr(now, 'yyyy-mm-dd HH:MM:SS')); %#ok<DATST,TNOW1>
-save(outPath, '-struct', 'allVars');
-fprintf('  saved -> %s\n', outPath);
+
+% -- Force MAT v7.3 (HDF5). v7 silently truncates variables bigger than
+% 2 GB, which is exactly the "tiny output file" failure mode that
+% appears with long 480x640 recordings. v7.3 has no per-variable limit.
+save(outPath, '-struct', 'allVars', '-v7.3');
+
+% -- Sanity check the file actually contains the events we just wrote.
+info = dir(outPath);
+expectedBytes = numel(reducedEvents) * 8;   % rough lower bound (double)
+if isempty(info)
+    error('reduceEventResolution: save failed -- no file at %s', outPath);
+end
+if info.bytes < 0.1 * expectedBytes
+    warning(['reduceEventResolution: saved file is %s but we wrote ' ...
+             '%s of events. Something is wrong with the save.'], ...
+             humanBytes(info.bytes), humanBytes(expectedBytes));
+end
+
+fprintf('  saved -> %s  (%s on disk)\n', outPath, humanBytes(info.bytes));
 fprintf('  REMINDER: set sensorSize = [%d %d] in main.m when running detectAruco on the reduced file.\n', ...
     newH, newW);
 
@@ -195,4 +235,16 @@ function out = autoStretch(img)
     else
         out = uint8(img / mx * 255);
     end
+end
+
+
+%% =========================================================================
+function s = humanBytes(n)
+    units = {'B','KB','MB','GB','TB'};
+    i = 1;
+    while n >= 1024 && i < length(units)
+        n = n / 1024;
+        i = i + 1;
+    end
+    s = sprintf('%.2f %s', n, units{i});
 end
