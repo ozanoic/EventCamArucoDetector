@@ -88,17 +88,25 @@ fprintf('Loaded %d events  |  sensor %dx%d\n', numEvents, W, H);
 [dictCodes, dictIDs] = buildDictionaryArrays();
 fprintf('Dictionary: %d markers\n', length(dictCodes));
 
-%% ---- Precompute event data (sorted by time) ----
-evX = events(:,1) + 1;
-evY = events(:,2) + 1;
-evT = events(:,4);
+%% ---- Precompute event data (sorted by time, compact types) ----
+% Use the smallest types that still represent the data losslessly. This
+% keeps the per-worker broadcast bundle small enough to deserialize on
+% large recordings (a 480x640 sensor + long capture can easily exceed
+% RAM if every coordinate is stored as a double).
+evX = uint16(events(:,1) + 1);          % 1..W           (max 65535)
+evY = uint16(events(:,2) + 1);          % 1..H
+evT = int64(events(:,4));               % microseconds  (>= int64 range)
 
 [evT, sortIdx] = sort(evT);
 evX = evX(sortIdx);
 evY = evY(sortIdx);
+clear events tmp sortIdx;               % free the Nx4 double copy
 
-tMin = evT(1);
-tMax = evT(end);
+fprintf('Event arrays:  evT %s (%.1f MB), evX/evY %s (%.1f MB each)\n', ...
+    class(evT), numel(evT)*8/1e6, class(evX), numel(evX)*2/1e6);
+
+tMin = double(evT(1));
+tMax = double(evT(end));
 tStart = tMin + max(windowDurations_us);
 tEnd   = tMax;
 numTicks = floor((tEnd - tStart) / tickStep_us) + 1;
@@ -185,6 +193,16 @@ if hasParallel
     lastPct = containers.Map('pct', 0);
     afterEach(dq, @(~) parProgressCallback(progressCount, lastPct, numTicks, parTicStart));
 
+    % --- Send the big event arrays to each worker exactly ONCE -----------
+    % Plain broadcast variables get duplicated per parfor iteration's
+    % serialised closure, which can blow up RAM on large recordings.
+    % parallel.pool.Constant transmits each value once per worker.
+    fprintf('Pushing event arrays to workers as parallel.pool.Constant...\n');
+    evT_c = parallel.pool.Constant(evT);
+    evX_c = parallel.pool.Constant(evX);
+    evY_c = parallel.pool.Constant(evY);
+    dict_c = parallel.pool.Constant(struct('codes', dictCodes, 'ids', dictIDs));
+
     parfor tick = 1:numTicks
         tNow = tickTimes(tick);
         tickRow = -1 * ones(1, numWindows);
@@ -192,11 +210,11 @@ if hasParallel
         for wi = 1:numWindows
             bestID = processWindow_local( ...
                 tNow, windowDurations_us(wi), ...
-                evT, evX, evY, H, W, ...
+                evT_c.Value, evX_c.Value, evY_c.Value, H, W, ...
                 blobParams, detectScale, useGPU, ...
                 markerCoords, sideSize, ...
                 numCells, codeSize, cellPx, ...
-                dictCodes, dictIDs, requestedMarkerIds);
+                dict_c.Value.codes, dict_c.Value.ids, requestedMarkerIds);
 
             tickRow(wi) = bestID;
 
@@ -275,13 +293,17 @@ else
             title(sprintf('Tick %d/%d  |  t = %.4f s', tick, numTicks, tNow/1e6));
             ylabel('Detection'); ylim([0 1.5]);
 
-            refWin = 6;
+            refWin = min(6, numWindows);
             dt = windowDurations_us(refWin);
-            tFrom = tNow - dt;
-            iS = bsearchLeft(evT, tFrom);
-            iE = bsearchRight(evT, tNow);
+            if isa(evT, 'int64')
+                iS = bsearchLeft(evT, int64(tNow - dt));
+                iE = bsearchRight(evT, int64(tNow));
+            else
+                iS = bsearchLeft(evT, tNow - dt);
+                iE = bsearchRight(evT, tNow);
+            end
             if iE >= iS
-                rX = evX(iS:iE); rY = evY(iS:iE);
+                rX = double(evX(iS:iE)); rY = double(evY(iS:iE));
                 vm = (rY >= 1) & (rY <= H) & (rX >= 1) & (rX <= W);
                 if any(vm)
                     refImg = accumarray([rY(vm), rX(vm)], 1, [H, W]);
@@ -393,14 +415,24 @@ function bestID = processWindow_local( ...
 
     bestID = -1;
 
-    tFrom = tNow - dt;
+    % Cast bsearch targets to the storage type of evT so mixed-type
+    % comparisons don't fall back to double arithmetic on every step.
+    if isa(evT, 'int64')
+        tFrom = int64(tNow - dt);
+        tNow_q = int64(tNow);
+    else
+        tFrom = tNow - dt;
+        tNow_q = tNow;
+    end
     iStart = bsearchLeft(evT, tFrom);
-    iEnd   = bsearchRight(evT, tNow);
+    iEnd   = bsearchRight(evT, tNow_q);
     nEv = iEnd - iStart + 1;
     if nEv < 10, return; end
 
-    wX = evX(iStart:iEnd);
-    wY = evY(iStart:iEnd);
+    % evX / evY may be uint16 (compact storage); cast to double for the
+    % logical comparisons and accumarray subscripts.
+    wX = double(evX(iStart:iEnd));
+    wY = double(evY(iStart:iEnd));
     validMask = (wY >= 1) & (wY <= H) & (wX >= 1) & (wX <= W);
     wXv = wX(validMask);
     wYv = wY(validMask);
