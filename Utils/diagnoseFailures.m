@@ -332,13 +332,14 @@ function playbackImpl(R, opts, H, W, evT, evX, evY, eventFile, resultFile, anyDe
     if opts.saveVideo
         outPath = opts.videoPath;
         if isempty(outPath)
-            [d, n] = fileparts(resultFile);
+            [d, n] = fileparts(char(resultFile));
             outPath = fullfile(d, [n '_playback.mp4']);
         end
+        outPath = char(outPath);              % VideoWriter wants char/string scalar
         try
             vw = VideoWriter(outPath, 'MPEG-4');
         catch
-            vw = VideoWriter(outPath);                 % AVI fallback
+            vw = VideoWriter(outPath);        % AVI fallback (e.g. no MPEG-4 codec)
         end
         vw.FrameRate = max(1, round(1000 / opts.stepMs));
         open(vw);
