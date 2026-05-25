@@ -26,20 +26,40 @@ function diagnoseFailures(resultFile, eventFile, opts)
 %        .windowMs    (default 8)        accumulation window
 %        .mode        (default 'failed') 'failed' | 'success' | 'both'
 %        .tickIndices (default [])       explicit tick indices to show
+%        .failingId   (default [])       show ticks where this marker
+%                                        was MISSED. Overrides .mode.
+%                                        Requires anyDetected_id<N> in
+%                                        the result file (re-run
+%                                        detectAruco with this ID in
+%                                        requestedMarkerIds).
+%        .referenceId (default [])       used with .failingId. When
+%                                        set, only show ticks where
+%                                        the reference marker WAS
+%                                        detected (= "we know the
+%                                        camera could see something
+%                                        useful here"). Empty -> any
+%                                        detection counts as reference.
 %        .sensorSize  (auto-inferred)    [H W]
 %        .blobParams  (defaults)         struct .minArea/.maxArea/.maxAspect
 %
-%  Example:
-%    diagnoseFailures( ...
-%        'Data/OzanEventData_22.05.2026/3/3_reduced_results_v3.mat', ...
-%        'Data/OzanEventData_22.05.2026/3/3_reduced.mat', ...
-%        struct('numTicks', 9, 'windowMs', 8));
+%  Examples:
+%    % All failed ticks
+%    diagnoseFailures(resultFile, eventFile);
+%
+%    % Why did marker 3 fail when something else was visible?
+%    diagnoseFailures(resultFile, eventFile, struct('failingId', 3));
+%
+%    % Same, but only when marker 8 specifically was found
+%    diagnoseFailures(resultFile, eventFile, ...
+%        struct('failingId', 3, 'referenceId', 8));
 
 if nargin < 3, opts = struct(); end
 if ~isfield(opts,'numTicks'),    opts.numTicks    = 9;        end
 if ~isfield(opts,'windowMs'),    opts.windowMs    = 8;        end
 if ~isfield(opts,'mode'),        opts.mode        = 'failed'; end
 if ~isfield(opts,'tickIndices'), opts.tickIndices = [];       end
+if ~isfield(opts,'failingId'),   opts.failingId   = [];       end
+if ~isfield(opts,'referenceId'), opts.referenceId = [];       end
 if ~isfield(opts,'sensorSize'),  opts.sensorSize  = [];       end
 if ~isfield(opts,'blobParams')
     opts.blobParams = struct( ...
@@ -85,8 +105,45 @@ nMiss  = sum(~anyDet);
 fprintf('  %d ticks total  |  %d detections  |  %d misses\n', ...
     length(anyDet), nDet, nMiss);
 
+selectorLabel = opts.mode;
 if ~isempty(opts.tickIndices)
     tickIndices = opts.tickIndices(:);
+    selectorLabel = sprintf('explicit %d ticks', numel(tickIndices));
+elseif ~isempty(opts.failingId)
+    % Per-marker miss diagnosis. Need the per-marker any-detect column
+    % the detector writes when requestedMarkerIds is non-empty.
+    fId    = opts.failingId;
+    fField = sprintf('anyDetected_id%d', fId);
+    if ~isfield(R, fField)
+        error('diagnoseFailures:missingField', ...
+              'result file has no %s field. Re-run detectAruco with %d in params.requestedMarkerIds.', ...
+              fField, fId);
+    end
+    missed = R.(fField) == 0;
+
+    if ~isempty(opts.referenceId)
+        rId    = opts.referenceId;
+        rField = sprintf('anyDetected_id%d', rId);
+        if ~isfield(R, rField)
+            error('diagnoseFailures:missingField', ...
+                  'result file has no %s field. Re-run detectAruco with %d in params.requestedMarkerIds.', ...
+                  rField, rId);
+        end
+        reference     = R.(rField) > 0;
+        selectorLabel = sprintf('id %d missed, id %d found', fId, rId);
+    else
+        reference     = anyDet;
+        selectorLabel = sprintf('id %d missed (anything else found)', fId);
+    end
+
+    pool = find(missed & reference);
+    fprintf('  %d ticks where %s\n', length(pool), selectorLabel);
+    if isempty(pool)
+        error(['No ticks matching "%s". Either the marker is always ' ...
+               'detected when something else is, or the reference ' ...
+               'marker never coincides with this miss.'], selectorLabel);
+    end
+    tickIndices = pickN(pool, opts.numTicks);
 else
     switch lower(opts.mode)
         case 'failed'
@@ -105,7 +162,7 @@ else
 end
 
 if isempty(tickIndices)
-    error('No ticks matching mode=%s.', opts.mode);
+    error('No ticks matching selector=%s.', selectorLabel);
 end
 
 nTicks = numel(tickIndices);
@@ -120,7 +177,7 @@ else
 end
 
 [~, baseName] = fileparts(eventFile);
-fig = figure('Name', sprintf('Diagnose: %s (%s ticks)', baseName, opts.mode), ...
+fig = figure('Name', sprintf('Diagnose: %s (%s)', baseName, selectorLabel), ...
              'Position', [60 60 1300 1100], 'Color', 'w');
 tl = tiledlayout(fig, sz, sz, 'TileSpacing', 'compact', 'Padding', 'compact');
 
@@ -179,8 +236,8 @@ for ti = 1:nTicks
           'FontSize', 8, 'Color', color);
 end
 
-title(tl, sprintf('Diagnose %s ticks  -  %d ms window  -  %s', ...
-                  opts.mode, opts.windowMs, baseName), ...
+title(tl, sprintf('Diagnose  -  %s  -  %d ms window  -  %s', ...
+                  selectorLabel, opts.windowMs, baseName), ...
       'FontSize', 11, 'FontWeight', 'bold');
 
 end
