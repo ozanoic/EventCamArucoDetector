@@ -229,14 +229,16 @@ if hasParallel
     dict_c = parallel.pool.Constant(struct('codes', dictCodes, 'ids', dictIDs));
 
     parPerMarkerFlat = false(numTicks, max(numWindows * nReportedLocal, 1));
+    parStats = zeros(numTicks, 6);   % rolled up to a global funnel after parfor
 
     parfor tick = 1:numTicks
         tNow = tickTimes(tick);
         tickRow = -1 * ones(1, numWindows);
         tickPerMarker = false(numWindows, max(nReportedLocal, 1));
+        tickStats = zeros(1, 6);
 
         for wi = 1:numWindows
-            [bestID, detVec] = processWindow_local( ...
+            [bestID, detVec, statsRow] = processWindow_local( ...
                 tNow, windowDurations_us(wi), ...
                 evT_c.Value, evX_c.Value, evY_c.Value, H, W, ...
                 blobParams, detectScale, useGPU, ...
@@ -250,6 +252,7 @@ if hasParallel
             if nReportedLocal > 0
                 tickPerMarker(wi, :) = detVec;
             end
+            tickStats = tickStats + statsRow;
 
             if earlyExitOnHit
                 if nReportedLocal > 0
@@ -267,6 +270,7 @@ if hasParallel
         if nReportedLocal > 0
             parPerMarkerFlat(tick, :) = reshape(tickPerMarker, 1, []);
         end
+        parStats(tick, :) = tickStats;
 
         send(dq, tick);
     end
@@ -276,19 +280,21 @@ if hasParallel
     if nReportedLocal > 0
         perMarkerFlat = parPerMarkerFlat;
     end
+    funnelStats = sum(parStats, 1);
 
 else
     % ==================================================================
     %  SEQUENTIAL PATH
     % ==================================================================
     seqTicStart = tic;
+    funnelStats = zeros(1, 6);
     for tick = 1:numTicks
         tNow = tStart + (tick - 1) * tickStep_us;
         tickRow = -1 * ones(1, numWindows);
         tickPerMarker = false(numWindows, max(nReportedLocal, 1));
 
         for wi = 1:numWindows
-            [bestID, detVec] = processWindow_local( ...
+            [bestID, detVec, statsRow] = processWindow_local( ...
                 tNow, windowDurations_us(wi), ...
                 evT, evX, evY, H, W, ...
                 blobParams, detectScale, useGPU, ...
@@ -304,6 +310,7 @@ else
             if bestID >= 0
                 detectionsPerWindow(wi) = detectionsPerWindow(wi) + 1;
             end
+            funnelStats = funnelStats + statsRow;
 
             if earlyExitOnHit
                 if nReportedLocal > 0
@@ -389,6 +396,24 @@ fprintf('Ticks with detection:    %d (%.1f%%)\n', ...
     ticksWithAnyDetection, 100*ticksWithAnyDetection/max(numTicks,1));
 fprintf('Total detections:        %d (across all windows)\n', totalDetections);
 fprintf('Elapsed time:            %.1fs\n', elapsed);
+% --- Pipeline funnel diagnostic ---
+% Tells you where you're losing detections. The big drop between any
+% two consecutive rows is the stage to look at.
+fprintf('\n--- Pipeline funnel (sum over every tick x window attempt) ---\n');
+fnNames = {'window attempts', ...
+           'with >= minEvents events', ...
+           'quads found (sum)', ...
+           'decode attempts', ...
+           'decode success (any ID)', ...
+           'decode in requestedIds'};
+fprintf('%-30s  %10s  %s\n', 'stage', 'count', 'survival %');
+fprintf('%-30s  %10s  %s\n', '-----', '-----', '----------');
+totalAttempts = max(funnelStats(1), 1);
+for fi = 1:length(fnNames)
+    fprintf('%-30s  %10d  %9.2f%%\n', fnNames{fi}, funnelStats(fi), ...
+        100 * funnelStats(fi) / totalAttempts);
+end
+
 fprintf('\n--- Per-window breakdown (all markers combined) ---\n');
 fprintf('%-10s  %10s  %10s\n', 'Window', 'Detections', 'Rate');
 fprintf('%-10s  %10s  %10s\n', '------', '----------', '----');
@@ -549,13 +574,20 @@ function out = ternary(cond, a, b)
     if cond, out = a; else, out = b; end
 end
 
-function [bestID, detVec] = processWindow_local( ...
+function [bestID, detVec, stats] = processWindow_local( ...
         tNow, dt, evT, evX, evY, H, W, ...
         blobParams, detectScale, useGPU, ...
         markerCoords, sideSize, ...
         numCells, codeSize, cellPx, ...
         dictCodes, dictIDs, requestedMarkerIds, reportedIds, ...
         hammingThresh, minEventsPerWindow)
+    % stats : 1 x 6 double row recording the pipeline funnel for this
+    %         single (tick, window) attempt. Columns are
+    %           [ windowAttempted, eventsSliced, quadsFound,
+    %             decodeAttempts, decodeSuccess, decodeInFilter ].
+    %         The caller sums these to a global funnel report.
+    stats = zeros(1, 6);
+    stats(1) = 1;   % windowAttempted
     % Full per-window pipeline: slice events -> count image -> blob detect
     % -> per-quad unwarp -> decode.
     %
@@ -588,6 +620,7 @@ function [bestID, detVec] = processWindow_local( ...
     iStart = bsearchLeft(evT, tFrom);
     iEnd   = bsearchRight(evT, tNow_q);
     nEv = iEnd - iStart + 1;
+    stats(2) = double(nEv > 0);    % eventsSliced (this window had ANY events)
     if nEv < minEventsPerWindow, return; end
 
     % evX / evY may be uint16 (compact storage); cast to double for the
@@ -613,6 +646,7 @@ function [bestID, detVec] = processWindow_local( ...
         scaledParams.minArea = blobParams.minArea * scaleArea;
         scaledParams.maxArea = blobParams.maxArea * scaleArea;
         quadsSmall = detectQuadBlob(smallMask, scaledParams);
+        stats(3) = length(quadsSmall);          % quadsFound
         if isempty(quadsSmall), return; end
         % Scale corners back to full resolution
         invScale = 1 / detectScale;
@@ -623,6 +657,7 @@ function [bestID, detVec] = processWindow_local( ...
     else
         activeMask = countImg > 0;
         quads = detectQuadBlob(activeMask, blobParams);
+        stats(3) = length(quads);                % quadsFound
         if isempty(quads), return; end
     end
 
@@ -651,9 +686,11 @@ function [bestID, detVec] = processWindow_local( ...
             warpedImg = gather(warpedImg);
         end
 
+        stats(4) = stats(4) + 1;          % decodeAttempts
         mid = decodeMarker_local( ...
             warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs, hammingThresh);
         if mid < 0, continue; end
+        stats(5) = stats(5) + 1;          % decodeSuccess (any ID, before filter)
 
         % Filter: in legacy single-marker mode, accept any decoded ID
         % that passes requestedMarkerIds. In multi-marker mode the
@@ -662,6 +699,7 @@ function [bestID, detVec] = processWindow_local( ...
                 ~any(requestedMarkerIds == int32(mid))
             continue;
         end
+        stats(6) = stats(6) + 1;          % decodeInFilter
 
         % Backward-compat scalar: first match wins.
         if bestID < 0
