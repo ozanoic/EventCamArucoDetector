@@ -137,6 +137,20 @@ end
 resultTable = zeros(numTicks, 2 + numWindows);
 detectionsPerWindow = zeros(1, numWindows);
 
+% Per-marker per-window tracking.  When requestedMarkerIds is non-empty
+% we run multi-marker mode: each window scans EVERY quad and records,
+% for each requested ID, whether that ID was decoded by some quad in
+% this (tick, window). The result is a numTicks x numWindows x nMarkers
+% logical tensor.  Stored flat (numTicks x (numWindows*nMarkers)) so
+% parfor can write a row per iteration.
+reportedIdsLocal = int32(requestedMarkerIds);
+nReportedLocal   = numel(reportedIdsLocal);
+if nReportedLocal > 0
+    perMarkerFlat = false(numTicks, numWindows * nReportedLocal);
+else
+    perMarkerFlat = [];   % single-marker (legacy) mode
+end
+
 blobParams        = params.blobParams;
 showVis           = params.showVis;
 earlyExitOnHit    = logical(params.earlyExitOnFirstHit);
@@ -203,35 +217,53 @@ if hasParallel
     evY_c = parallel.pool.Constant(evY);
     dict_c = parallel.pool.Constant(struct('codes', dictCodes, 'ids', dictIDs));
 
+    parPerMarkerFlat = false(numTicks, max(numWindows * nReportedLocal, 1));
+
     parfor tick = 1:numTicks
         tNow = tickTimes(tick);
         tickRow = -1 * ones(1, numWindows);
+        tickPerMarker = false(numWindows, max(nReportedLocal, 1));
 
         for wi = 1:numWindows
-            bestID = processWindow_local( ...
+            [bestID, detVec] = processWindow_local( ...
                 tNow, windowDurations_us(wi), ...
                 evT_c.Value, evX_c.Value, evY_c.Value, H, W, ...
                 blobParams, detectScale, useGPU, ...
                 markerCoords, sideSize, ...
                 numCells, codeSize, cellPx, ...
-                dict_c.Value.codes, dict_c.Value.ids, requestedMarkerIds);
+                dict_c.Value.codes, dict_c.Value.ids, ...
+                requestedMarkerIds, reportedIdsLocal);
 
             tickRow(wi) = bestID;
+            if nReportedLocal > 0
+                tickPerMarker(wi, :) = detVec;
+            end
 
-            if earlyExitOnHit && bestID >= 0
-                break;     % skip the remaining windows for this tick
+            if earlyExitOnHit
+                if nReportedLocal > 0
+                    % stop only when EVERY reported marker has been seen
+                    if all(any(tickPerMarker, 1)), break; end
+                else
+                    if bestID >= 0, break; end
+                end
             end
         end
 
         anyDet = double(any(tickRow >= 0));
         parResultTable(tick, :) = [tNow, anyDet, tickRow];
         parDetPerWindow(tick, :) = double(tickRow >= 0);
+        if nReportedLocal > 0
+            parPerMarkerFlat(tick, :) = reshape(tickPerMarker, 1, []);
+        end
 
         send(dq, tick);
     end
 
     resultTable = parResultTable;
     detectionsPerWindow = sum(parDetPerWindow, 1);
+    if nReportedLocal > 0
+        perMarkerFlat = parPerMarkerFlat;
+    end
 
 else
     % ==================================================================
@@ -241,27 +273,39 @@ else
     for tick = 1:numTicks
         tNow = tStart + (tick - 1) * tickStep_us;
         tickRow = -1 * ones(1, numWindows);
+        tickPerMarker = false(numWindows, max(nReportedLocal, 1));
 
         for wi = 1:numWindows
-            bestID = processWindow_local( ...
+            [bestID, detVec] = processWindow_local( ...
                 tNow, windowDurations_us(wi), ...
                 evT, evX, evY, H, W, ...
                 blobParams, detectScale, useGPU, ...
                 markerCoords, sideSize, ...
                 numCells, codeSize, cellPx, ...
-                dictCodes, dictIDs, requestedMarkerIds);
+                dictCodes, dictIDs, requestedMarkerIds, reportedIdsLocal);
 
             tickRow(wi) = bestID;
+            if nReportedLocal > 0
+                tickPerMarker(wi, :) = detVec;
+            end
             if bestID >= 0
                 detectionsPerWindow(wi) = detectionsPerWindow(wi) + 1;
-                if earlyExitOnHit
-                    break;
+            end
+
+            if earlyExitOnHit
+                if nReportedLocal > 0
+                    if all(any(tickPerMarker, 1)), break; end
+                else
+                    if bestID >= 0, break; end
                 end
             end
         end
 
         anyDet = double(any(tickRow >= 0));
         resultTable(tick, :) = [tNow, anyDet, tickRow];
+        if nReportedLocal > 0
+            perMarkerFlat(tick, :) = reshape(tickPerMarker, 1, []);
+        end
 
         % Progress output (every 1%)
         pctNow = floor(100 * tick / numTicks);
@@ -343,25 +387,37 @@ for wi = 1:numWindows
 end
 
 %% ---- Per-marker breakdown ----
-% If the user is hunting for specific IDs, also report each one separately
-% so you can see how the algorithm performs on marker 3 vs marker 8 vs ...
-% When no filter is set, we instead break down by every ID that was
-% actually decoded.
-winColsAll = resultTable(:, 3:end);    % numTicks x numWindows
+% In multi-marker mode (requestedMarkerIds non-empty) we have a
+% full numTicks x numWindows x nMarkers logical tensor (perMarkerFlat),
+% so we can answer "did marker 8 appear at tick T in window W?" even
+% when another marker was decoded by an earlier quad in the same frame.
+%
+% In legacy single-marker mode we fall back to the scalar win_Xms
+% columns and only see the FIRST decoded ID per (tick, window).
+winColsAll = resultTable(:, 3:end);    % numTicks x numWindows scalar IDs
 if ~isempty(requestedMarkerIds)
     reportIds = double(requestedMarkerIds);
 else
     reportIds = unique(winColsAll(winColsAll >= 0))';
 end
 
-perMarker = struct();   % filled below, also written into results
+perMarker = struct();
+useMultiMarker = ~isempty(perMarkerFlat) && ~isempty(reportIds);
+if useMultiMarker
+    perMarkerTensor = reshape(perMarkerFlat, numTicks, numWindows, length(reportIds));
+end
+
 if ~isempty(reportIds)
     fprintf('\n--- Per-marker breakdown ---\n');
     fprintf('%-8s  %8s  %12s  %8s\n', 'Marker', 'AnyHit', 'AnyHit %', 'TotalHit');
     fprintf('%-8s  %8s  %12s  %8s\n', '------', '------', '--------', '--------');
     for ri = 1:length(reportIds)
         mid = reportIds(ri);
-        hits = winColsAll == double(mid);            % numTicks x numWindows logical
+        if useMultiMarker
+            hits = perMarkerTensor(:, :, ri);     % numTicks x numWindows logical
+        else
+            hits = winColsAll == double(mid);
+        end
         anyForId = any(hits, 2);
         countPerWin = sum(hits, 1);
         nAny  = sum(anyForId);
@@ -371,9 +427,10 @@ if ~isempty(reportIds)
         perMarker(ri).id                  = mid;
         perMarker(ri).anyDetected         = double(anyForId);
         perMarker(ri).detectionsPerWindow = countPerWin;
+        perMarker(ri).hits                = hits;   % carried into results below
     end
 
-    % Also a per-window table showing how each marker fares per window
+    % Per-window table showing how each marker fares per window
     fprintf('\n--- Per-window, per-marker detection counts ---\n');
     hdr = sprintf('%-10s', 'Window');
     for ri = 1:length(reportIds)
@@ -402,9 +459,16 @@ results.windowDurations_ms = windowDurations_ms;
 results.detectionsPerWindow = detectionsPerWindow;
 results.requestedMarkerIds  = double(requestedMarkerIds);
 
-% Per-marker fields. One pair of fields per reported ID:
-%   anyDetected_id<N>         : Nx1 double (0/1) -- any window saw marker N
-%   detectionsPerWindow_id<N> : 1xW double       -- per-window counts for N
+% Per-marker fields. For each reported ID we write:
+%   anyDetected_id<N>           : Nx1 double (0/1)  -- any window saw N
+%   detectionsPerWindow_id<N>   : 1xW double         -- per-window counts
+%   win_<X>ms_id<N>             : Nx1 double (0/1)  -- per (tick, window)
+%                                                       per-marker hits.
+% The win_<X>ms_id<N> columns are the per-marker analogue of the legacy
+% scalar win_<X>ms columns and let downstream code answer "in this
+% window at this tick, did marker N fire?" -- even if the same tick had
+% several markers visible. They are only available in multi-marker mode
+% (requestedMarkerIds non-empty).
 results.markerIdsReported = reportIds;
 for ri = 1:length(reportIds)
     mid = reportIds(ri);
@@ -412,6 +476,14 @@ for ri = 1:length(reportIds)
     fname_cnt = sprintf('detectionsPerWindow_id%d', mid);
     results.(fname_any) = perMarker(ri).anyDetected;
     results.(fname_cnt) = perMarker(ri).detectionsPerWindow;
+
+    if useMultiMarker
+        hits = perMarker(ri).hits;       % numTicks x numWindows logical
+        for wi = 1:numWindows
+            fname = sprintf('win_%dms_id%d', windowDurations_ms(wi), mid);
+            results.(fname) = double(hits(:, wi));
+        end
+    end
 end
 
 end
@@ -464,16 +536,31 @@ function out = ternary(cond, a, b)
     if cond, out = a; else, out = b; end
 end
 
-function bestID = processWindow_local( ...
+function [bestID, detVec] = processWindow_local( ...
         tNow, dt, evT, evX, evY, H, W, ...
         blobParams, detectScale, useGPU, ...
         markerCoords, sideSize, ...
         numCells, codeSize, cellPx, ...
-        dictCodes, dictIDs, requestedMarkerIds)
+        dictCodes, dictIDs, requestedMarkerIds, reportedIds)
     % Full per-window pipeline: slice events -> count image -> blob detect
-    % -> per-quad unwarp -> decode. Returns the decoded marker ID, or -1.
+    % -> per-quad unwarp -> decode.
+    %
+    % Returns:
+    %   bestID  : the FIRST decoded marker ID that matched the filter
+    %             (-1 if none).  Kept for backward compatibility with
+    %             the existing win_<X>ms columns.
+    %   detVec  : 1 x length(reportedIds) logical.  detVec(k) is true
+    %             if ANY quad in this (tick, window) decoded to
+    %             reportedIds(k). Empty when reportedIds is empty
+    %             (legacy single-marker mode).
+    %
+    % We scan EVERY surviving quad so that a frame containing several
+    % markers (e.g. ids 3 and 8 visible at once) is recorded as such.
+    % Only break early if all reported markers have been seen.
 
     bestID = -1;
+    nReported = numel(reportedIds);
+    detVec = false(1, nReported);
 
     % Cast bsearch targets to the storage type of evT so mixed-type
     % comparisons don't fall back to double arithmetic on every step.
@@ -552,9 +639,33 @@ function bestID = processWindow_local( ...
 
         mid = decodeMarker_local( ...
             warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
+        if mid < 0, continue; end
 
-        if mid >= 0 && (isempty(requestedMarkerIds) || any(requestedMarkerIds == int32(mid)))
+        % Filter: in legacy single-marker mode, accept any decoded ID
+        % that passes requestedMarkerIds. In multi-marker mode the
+        % filter is implicit in reportedIds (== requestedMarkerIds).
+        if ~isempty(requestedMarkerIds) && ...
+                ~any(requestedMarkerIds == int32(mid))
+            continue;
+        end
+
+        % Backward-compat scalar: first match wins.
+        if bestID < 0
             bestID = mid;
+        end
+
+        % Multi-marker mask: which reported ID did this quad match?
+        if nReported > 0
+            idx = find(reportedIds == int32(mid), 1);
+            if ~isempty(idx)
+                detVec(idx) = true;
+            end
+            % Stop early only when every reported marker is in.
+            if all(detVec)
+                return;
+            end
+        else
+            % Legacy mode: original "first hit wins" early exit.
             return;
         end
     end

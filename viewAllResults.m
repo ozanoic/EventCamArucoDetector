@@ -146,14 +146,25 @@ function ids = discoverMarkerIds(datasets)
     ids = unique(seen(:))';
 end
 
-function mask = detectionMaskForMarker(colVec, markerFilter)
-    % Returns a logical column the same length as colVec:
-    %   markerFilter == []      -> col >= 0          (any marker)
-    %   markerFilter == <id>    -> col == markerFilter (that marker only)
+function mask = perWindowPerMarkerMask(d, windowMs, markerFilter)
+    % Multi-marker-aware mask for a single (window, marker) cell.
+    %
+    %  markerFilter == [] : any marker -> read scalar win_<X>ms (>= 0)
+    %  markerFilter == M  : prefer win_<X>ms_idM (logical per (tick,window))
+    %                       which captures markers that the scalar column
+    %                       would miss when several markers shared a tick.
+    %                       Falls back to win_<X>ms == M when the new field
+    %                       is absent (older result files).
+    scalarField = sprintf('win_%dms', windowMs);
     if isempty(markerFilter)
-        mask = colVec(:) >= 0;
+        mask = d.(scalarField)(:) >= 0;
+        return;
+    end
+    perField = sprintf('win_%dms_id%d', windowMs, markerFilter);
+    if isfield(d, perField)
+        mask = d.(perField)(:) > 0;
     else
-        mask = colVec(:) == markerFilter;
+        mask = d.(scalarField)(:) == markerFilter;
     end
 end
 
@@ -183,8 +194,10 @@ end
 
 function anyDet = perMarkerAnyDetect(d, mid)
     % Returns an Nx1 logical: was marker `mid` decoded by ANY window at
-    % each tick? Prefers the precomputed anyDetected_idN field, falls
-    % back to scanning the win_*ms columns if it's not there.
+    % each tick?  Resolution order:
+    %   (1) anyDetected_id<mid> -- written by detectAruco / mergeResults
+    %   (2) win_<X>ms_id<mid>   -- per-window per-marker columns
+    %   (3) win_<X>ms == mid    -- legacy scalar column (loses some hits)
     fname = sprintf('anyDetected_id%d', mid);
     if isfield(d, fname)
         anyDet = d.(fname) > 0;
@@ -194,8 +207,13 @@ function anyDet = perMarkerAnyDetect(d, mid)
     anyDet = false(nTicks, 1);
     wins = double(d.windowDurations_ms);
     for wi = 1:length(wins)
-        col = d.(sprintf('win_%dms', wins(wi)));
-        anyDet = anyDet | (col(:) == mid);
+        perField = sprintf('win_%dms_id%d', wins(wi), mid);
+        if isfield(d, perField)
+            anyDet = anyDet | (d.(perField)(:) > 0);
+        else
+            col = d.(sprintf('win_%dms', wins(wi)));
+            anyDet = anyDet | (col(:) == mid);
+        end
     end
 end
 
@@ -244,8 +262,7 @@ function buildSummaryTab(parent, datasets, markerFilter)
         wins = double(d.windowDurations_ms);
         winMask = false(nTicks, length(wins));
         for wi = 1:length(wins)
-            winMask(:, wi) = detectionMaskForMarker( ...
-                d.(sprintf('win_%dms', wins(wi))), markerFilter);
+            winMask(:, wi) = perWindowPerMarkerMask(d, wins(wi), markerFilter);
         end
         overallRates(i) = 100 * sum(any(winMask, 2)) / max(nTicks, 1);
 
@@ -386,8 +403,7 @@ function buildDetailTab(parent, dataset, markerFilter)
     % Build detection matrix (filtered by marker selection)
     detMat = false(nTicks, numWindows);
     for wi = 1:numWindows
-        detMat(:, wi) = detectionMaskForMarker( ...
-            d.(sprintf('win_%dms', winMs(wi))), markerFilter);
+        detMat(:, wi) = perWindowPerMarkerMask(d, winMs(wi), markerFilter);
     end
     anyDet = any(detMat, 2);
 
