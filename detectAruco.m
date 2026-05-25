@@ -238,15 +238,20 @@ if hasParallel
     lastPct = containers.Map('pct', 0);
     afterEach(dq, @(~) parProgressCallback(progressCount, lastPct, numTicks, parTicStart));
 
-    % --- Send the big event arrays to each worker exactly ONCE -----------
-    % Plain broadcast variables get duplicated per parfor iteration's
-    % serialised closure, which can blow up RAM on large recordings.
-    % parallel.pool.Constant transmits each value once per worker.
-    fprintf('Pushing event arrays to workers as parallel.pool.Constant...\n');
-    evT_c = parallel.pool.Constant(evT);
-    evX_c = parallel.pool.Constant(evX);
-    evY_c = parallel.pool.Constant(evY);
-    dict_c = parallel.pool.Constant(struct('codes', dictCodes, 'ids', dictIDs));
+    % --- Send the big event arrays to each worker as broadcast vars.
+    % We used to wrap these in parallel.pool.Constant to avoid one copy
+    % per iteration, but that proved fragile (Constant serialisation can
+    % fail on OneDrive-locked temp dirs and on a stale parpool).  Since
+    % we now store events as int64/uint16 instead of doubles, the
+    % broadcast bundle is ~6x smaller than it used to be and fits
+    % comfortably for typical recordings.
+    %
+    % If you hit "Out of Memory during deserialization" here:
+    %   * reduce the parpool worker count: delete(gcp('nocreate'));
+    %     parpool('local', 4)
+    %   * or set params.useParallel = false to process sequentially.
+    bytes = numel(evT)*8 + numel(evX)*2 + numel(evY)*2;
+    fprintf('Broadcast bundle per worker: %.1f MB\n', bytes / 1e6);
 
     parPerMarkerFlat = false(numTicks, max(numWindows * nReportedLocal, 1));
     parStats = zeros(numTicks, 6);   % rolled up to a global funnel after parfor
@@ -260,11 +265,11 @@ if hasParallel
         for wi = 1:numWindows
             [bestID, detVec, statsRow] = processWindow_local( ...
                 tNow, windowDurations_us(wi), ...
-                evT_c.Value, evX_c.Value, evY_c.Value, H, W, ...
+                evT, evX, evY, H, W, ...
                 blobParams, detectScale, useGPU, ...
                 markerCoords, sideSize, ...
                 numCells, codeSize, cellPx, ...
-                dict_c.Value.codes, dict_c.Value.ids, ...
+                dictCodes, dictIDs, ...
                 requestedMarkerIds, reportedIdsLocal, ...
                 hammingThresh, minEventsPerWin, ...
                 refineCorners, refineSearchPx);
