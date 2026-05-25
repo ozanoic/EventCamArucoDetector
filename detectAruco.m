@@ -864,16 +864,36 @@ function refined = refineQuadCorners_local(countImg, roughCorners, searchHalfWid
         end
     end
 
+    % Compute the local edge-length scale at each corner so we can cap
+    % drift relative to the marker's own size (instead of a fixed
+    % pixel budget that's too generous for small markers and too
+    % tight for big ones).
+    edgeLensRough = zeros(4, 1);
+    for ei = 1:4
+        edgeLensRough(ei) = norm( ...
+            roughCorners(mod(ei, 4) + 1, :) - roughCorners(ei, :));
+    end
+
     % Intersect adjacent edges to recover corners.
     refined = zeros(4, 2);
     for ei = 1:4
         prevEi = mod(ei - 2, 4) + 1;
         ipt = intersectLines_local(edgeLines(prevEi, :), edgeLines(ei, :));
-        % Reject crazy results -- fall back to the rough corner.
+
+        % Per-corner drift limit: the smaller of
+        %   (a) 15% of the shorter incident edge length, and
+        %   (b) 2*searchHalfWidth + 2 (absolute safety net).
+        % This prevents refinement from snapping to a strong nearby
+        % edge (laptop screen, paper boundary) that's much further
+        % away than the marker's own corner.
+        incidentLen = min(edgeLensRough(ei), edgeLensRough(prevEi));
+        driftCap = min(0.15 * incidentLen, 2 * searchHalfWidth + 2);
+        driftCap = max(driftCap, 1);   % never less than 1 px
+
         if any(isnan(ipt)) || any(isinf(ipt)) || ...
                 ipt(1) < -100 || ipt(1) > W + 100 || ...
                 ipt(2) < -100 || ipt(2) > H + 100 || ...
-                norm(ipt - roughCorners(ei, :)) > 2 * searchHalfWidth + 5
+                norm(ipt - roughCorners(ei, :)) > driftCap
             refined(ei, :) = roughCorners(ei, :);
         else
             refined(ei, :) = ipt;
