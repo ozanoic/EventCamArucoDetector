@@ -9,14 +9,14 @@ addpath("Utils");
 % filterEventNoise('Data/OzanEventData_22.05.2026/1/1.mat', struct('method', 'hot+bg', 'dt_ms', 1));
 
 %% ---- Input ----
-% matFiles    = ["Data/OzanEventData_22.05.2026/1/1_reduced.mat"];
+matFiles    = ["Data/OzanEventData_22.05.2026/3/3_reduced.mat"];
 % reduceEventResolution('Data/OzanEventData_22.05.2026/4/4.mat');
 
-matFiles    = ["Data/OzanEventData_22.05.2026/1/1_reduced.mat",...
-    "Data/OzanEventData_22.05.2026/2/2_reduced.mat",...
-    "Data/OzanEventData_22.05.2026/3/3_reduced.mat",...
-    "Data/OzanEventData_22.05.2026/4/4_reduced.mat",...
-    "Data/OzanEventData_22.05.2026/5/5_reduced.mat"];
+% matFiles    = ["Data/OzanEventData_22.05.2026/1/1_reduced.mat",...
+%     "Data/OzanEventData_22.05.2026/2/2_reduced.mat",...
+%     "Data/OzanEventData_22.05.2026/3/3_reduced.mat",...
+%     "Data/OzanEventData_22.05.2026/4/4_reduced.mat",...
+%     "Data/OzanEventData_22.05.2026/5/5_reduced.mat"];
 
 % matFiles    = ["Data/marker_z2_cross_low/marker_z2_cross_low.mat", ...
 %     "Data/marker_z2_cross_med/marker_z2_cross_med.mat", ...
@@ -35,7 +35,7 @@ sensorSize = [240, 320];   % [height, width]
 % sensorSize = [480, 640];   % [height, width]
 
 %% ---- Parameters ----
-params.windowDurations_ms = [1, 2, 3, 4, 5, 10, 15, 20, 30, 50, 70, 100, 150, 200, 250, 2000];
+params.windowDurations_ms = [3, 5, 8, 10, 15, 20, 30, 50, 70];
 % params.windowDurations_ms = [150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750];
 params.tickStep_us        = 1000000;       % 1 ms tick step
 params.showVis            = false;
@@ -72,13 +72,22 @@ params.useGPU = false;
 %   cell no longer kills the entire decode. ARUCO_MIP_36h12 has
 %   minimum inter-marker Hamming distance 12, so values up to ~4 stay
 %   unambiguous.
-params.decoderHammingDist = 2;
+params.decoderHammingDist = 4;
 
 % minEventsPerWindow: skip windows with fewer than N events in their
 %   [tNow - dt, tNow] range. Was hard-coded to 10. Faint markers can
 %   land just under that on 480x640 sensors -- lower it to 5 if the
 %   short windows are returning zero detections in your runs.
 params.minEventsPerWindow = 5;
+
+% refineCorners: sub-pixel corner refinement. The blob detector's
+%   min-area-rect corners are typically 2-4 px off for noisy event
+%   blobs, which shifts every cell-boundary sample in the unwarped
+%   image and makes the decoder miss the marker. Turn this on if
+%   diagnoseFailures shows "marker is outlined in red, but the
+%   outline corners are clearly off the real marker corners".
+params.refineCorners  = true;
+params.refineSearchPx = 5;     % perpendicular search half-width (px)
 
 % Marker grid (ARUCO_MIP_36h12: 8x8 grid, 6x6 inner code)
 params.numCells = 8;
@@ -99,6 +108,8 @@ for i = 1:length(matFiles)
     outputFile = fullfile(inputDir, inputName + "_results_v3.mat");
     save(outputFile, '-struct', 'results');
     fprintf('Results saved to %s\n', outputFile);
+
+    diagnoseFailures(outputFile, matFiles(i), struct('mode', 'both'));
 end
 
 %%

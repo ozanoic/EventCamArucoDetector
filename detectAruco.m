@@ -33,6 +33,19 @@ function results = detectAruco(matFile, sensorSize, params)
 %                              gpuArray (forces sequential mode because
 %                              the GPU cannot be shared across parfor
 %                              workers efficiently). Default false.
+%      .decoderHammingDist   - >=0, default 0. Accept decodes within k
+%                              bit-flips of any dict code (Hamming
+%                              tolerance for noisy DVS). 0 = exact match.
+%      .minEventsPerWindow   - skip windows whose event count is below
+%                              this. Default 10. Lower it for faint or
+%                              short-duration markers.
+%      .refineCorners        - true: sub-pixel corner refinement using
+%                              perpendicular gradient peaks (per-edge
+%                              line fit + intersection). Default false.
+%                              Big win when blob-detector corners are
+%                              imprecise (typical for real DVS).
+%      .refineSearchPx       - perpendicular search half-width (px).
+%                              Default 5.
 %
 %  Output:
 %    results - struct with fields:
@@ -56,6 +69,8 @@ if ~isfield(params,'detectScale'),          params.detectScale          = 1.0;  
 if ~isfield(params,'useGPU'),               params.useGPU               = false; end
 if ~isfield(params,'decoderHammingDist'),   params.decoderHammingDist   = 0;    end
 if ~isfield(params,'minEventsPerWindow'),   params.minEventsPerWindow   = 10;   end
+if ~isfield(params,'refineCorners'),        params.refineCorners        = false; end
+if ~isfield(params,'refineSearchPx'),       params.refineSearchPx       = 5;     end
 
 % Normalise requested marker IDs into a sorted int32 row vector.
 requestedMarkerIds = int32(params.requestedMarkerIds(:)');
@@ -160,6 +175,11 @@ detectScale       = params.detectScale;
 useGPU            = logical(params.useGPU);
 hammingThresh     = max(0, round(params.decoderHammingDist));
 minEventsPerWin   = max(1, round(params.minEventsPerWindow));
+refineCorners     = logical(params.refineCorners);
+refineSearchPx    = max(2, round(params.refineSearchPx));
+if refineCorners
+    fprintf('Corner refinement: ON  (perpendicular search half-width = %d px)\n', refineSearchPx);
+end
 if hammingThresh > 0
     fprintf('Decoder Hamming threshold: %d  (accept decodes within %d bit-flips of any dict code)\n', ...
         hammingThresh, hammingThresh);
@@ -246,7 +266,8 @@ if hasParallel
                 numCells, codeSize, cellPx, ...
                 dict_c.Value.codes, dict_c.Value.ids, ...
                 requestedMarkerIds, reportedIdsLocal, ...
-                hammingThresh, minEventsPerWin);
+                hammingThresh, minEventsPerWin, ...
+                refineCorners, refineSearchPx);
 
             tickRow(wi) = bestID;
             if nReportedLocal > 0
@@ -580,7 +601,8 @@ function [bestID, detVec, stats] = processWindow_local( ...
         markerCoords, sideSize, ...
         numCells, codeSize, cellPx, ...
         dictCodes, dictIDs, requestedMarkerIds, reportedIds, ...
-        hammingThresh, minEventsPerWindow)
+        hammingThresh, minEventsPerWindow, ...
+        refineCorners, refineSearchPx)
     % stats : 1 x 6 double row recording the pipeline funnel for this
     %         single (tick, window) attempt. Columns are
     %           [ windowAttempted, eventsSliced, quadsFound,
@@ -680,6 +702,20 @@ function [bestID, detVec, stats] = processWindow_local( ...
 
     for qi = 1:length(quads)
         corners = orderCornersForUnwarp_local(quads{qi});
+
+        % Sub-pixel corner refinement: walk perpendicular to each rough
+        % edge, find the gradient peak in countImg, fit a line, and
+        % intersect adjacent lines. Without this, the min-area-rect
+        % corners are typically 2-4 px off on noisy event blobs, which
+        % shifts every cell-boundary sample in the unwarped image and
+        % makes the decoder miss even with Hamming tolerance.
+        if refineCorners
+            refined = refineQuadCorners_local(countImg, corners, refineSearchPx);
+            if ~any(isnan(refined(:))) && ~any(isinf(refined(:)))
+                corners = orderCornersForUnwarp_local(refined);
+            end
+        end
+
         warpedImg = unwarpQuad_local(countSrc, corners, markerCoords, sideSize);
         if isempty(warpedImg), continue; end
         if isa(warpedImg, 'gpuArray')
@@ -721,6 +757,155 @@ function [bestID, detVec, stats] = processWindow_local( ...
             return;
         end
     end
+end
+
+
+%% =========================================================================
+%                    SUB-PIXEL CORNER REFINEMENT
+%% =========================================================================
+function refined = refineQuadCorners_local(countImg, roughCorners, searchHalfWidth)
+    % Improve quad corners by fitting lines to the actual event-density
+    % ridges that form each edge.
+    %
+    % For each of the 4 edges:
+    %   1) walk along the rough edge in small steps,
+    %   2) at each step sample a perpendicular line of countImg values,
+    %   3) find the position of the peak (parabolic sub-pixel fit),
+    %   4) fit a straight line through every collected peak.
+    % Then intersect adjacent fitted lines to recover the refined corners.
+    %
+    % If anything goes wrong (degenerate line, near-parallel intersection,
+    % too few valid samples), we fall back to the corresponding rough
+    % corner for that vertex.
+
+    [H, W] = size(countImg);
+    edgeLines = zeros(4, 3);             % each row: [a b c]  ax+by+c=0
+    countImgD = double(countImg);
+
+    for ei = 1:4
+        p1 = roughCorners(ei, :);
+        p2 = roughCorners(mod(ei, 4) + 1, :);
+
+        edgeVec = p2 - p1;
+        edgeLen = norm(edgeVec);
+        if edgeLen < 6
+            edgeLines(ei, :) = pointsToLine_local(p1, p2);
+            continue;
+        end
+
+        edgeUnit = edgeVec / edgeLen;
+        perpUnit = [-edgeUnit(2), edgeUnit(1)];
+
+        % Sample positions along the edge, stay clear of the corners.
+        nSamples = max(8, floor(edgeLen / 2));
+        ts = (0.15 + (0:nSamples-1)' * (0.70 / max(nSamples - 1, 1)));
+        centers = p1 + ts .* edgeVec;
+
+        offsets = (-searchHalfWidth:searchHalfWidth);
+        nOff = length(offsets);
+
+        % Build (nSamples x nOff) sample positions perpendicular to the edge
+        xs = round(centers(:, 1) + offsets * perpUnit(1));
+        ys = round(centers(:, 2) + offsets * perpUnit(2));
+
+        inB = xs >= 1 & xs <= W & ys >= 1 & ys <= H;
+        xsC = min(max(xs, 1), W);
+        ysC = min(max(ys, 1), H);
+        linIdx = sub2ind([H W], ysC, xsC);
+        vals = countImgD(linIdx);
+        vals(~inB) = 0;
+
+        % Peak per row (per along-edge sample point)
+        [maxVals, maxIdx] = max(vals, [], 2);
+
+        peakPts = zeros(nSamples, 2);
+        keep    = false(nSamples, 1);
+        for s = 1:nSamples
+            if maxVals(s) <= 0, continue; end
+            mi = maxIdx(s);
+            peakOff = offsets(mi);
+
+            % Parabolic sub-pixel refinement when the peak isn't on the edge.
+            if mi > 1 && mi < nOff && vals(s, mi-1) > 0 && vals(s, mi+1) > 0
+                v1 = vals(s, mi - 1);
+                v2 = vals(s, mi);
+                v3 = vals(s, mi + 1);
+                denom = v1 - 2*v2 + v3;
+                if abs(denom) > 1e-6
+                    sub = 0.5 * (v1 - v3) / denom;
+                    if abs(sub) <= 1, peakOff = peakOff + sub; end
+                end
+            end
+
+            peakPts(s, :) = centers(s, :) + peakOff * perpUnit;
+            keep(s) = true;
+        end
+
+        peakPts = peakPts(keep, :);
+        if size(peakPts, 1) < 3
+            edgeLines(ei, :) = pointsToLine_local(p1, p2);
+        else
+            edgeLines(ei, :) = fitLine_local(peakPts);
+        end
+    end
+
+    % Intersect adjacent edges to recover corners.
+    refined = zeros(4, 2);
+    for ei = 1:4
+        prevEi = mod(ei - 2, 4) + 1;
+        ipt = intersectLines_local(edgeLines(prevEi, :), edgeLines(ei, :));
+        % Reject crazy results -- fall back to the rough corner.
+        if any(isnan(ipt)) || any(isinf(ipt)) || ...
+                ipt(1) < -100 || ipt(1) > W + 100 || ...
+                ipt(2) < -100 || ipt(2) > H + 100 || ...
+                norm(ipt - roughCorners(ei, :)) > 2 * searchHalfWidth + 5
+            refined(ei, :) = roughCorners(ei, :);
+        else
+            refined(ei, :) = ipt;
+        end
+    end
+end
+
+
+function L = pointsToLine_local(p1, p2)
+    a = p2(2) - p1(2);
+    b = p1(1) - p2(1);
+    c = p2(1) * p1(2) - p1(1) * p2(2);
+    n = sqrt(a*a + b*b);
+    if n > 1e-9
+        L = [a/n, b/n, c/n];
+    else
+        L = [1 0 0];
+    end
+end
+
+
+function L = fitLine_local(pts)
+    % Total least squares line fit (orthogonal regression).
+    centroid = mean(pts, 1);
+    centered = pts - centroid;
+    [~, ~, V] = svd(centered, 0);
+    normal = V(:, 2);                    % smallest singular vector
+    a = normal(1); b = normal(2);
+    c = -(a * centroid(1) + b * centroid(2));
+    n = sqrt(a*a + b*b);
+    if n > 1e-9
+        L = [a/n, b/n, c/n];
+    else
+        L = [1 0 0];
+    end
+end
+
+
+function pt = intersectLines_local(L1, L2)
+    a = L1(1); b = L1(2); c = L1(3);
+    d = L2(1); e = L2(2); f = L2(3);
+    denom = a * e - b * d;
+    if abs(denom) < 1e-9
+        pt = [NaN, NaN];
+        return;
+    end
+    pt = [(b*f - c*e) / denom, (c*d - a*f) / denom];
 end
 
 function corners = orderCornersForUnwarp_local(corners)
