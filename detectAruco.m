@@ -706,32 +706,42 @@ function [bestID, detVec, stats] = processWindow_local( ...
     end
 
     for qi = 1:length(quads)
-        corners = orderCornersForUnwarp_local(quads{qi});
+        roughCorners = orderCornersForUnwarp_local(quads{qi});
 
-        % Sub-pixel corner refinement: walk perpendicular to each rough
-        % edge, find the gradient peak in countImg, fit a line, and
-        % intersect adjacent lines. Without this, the min-area-rect
-        % corners are typically 2-4 px off on noisy event blobs, which
-        % shifts every cell-boundary sample in the unwarped image and
-        % makes the decoder miss even with Hamming tolerance.
+        % Try refined corners first (if enabled), then rough corners as
+        % a fallback.  Refinement is great when there are enough events
+        % along each edge to fit a real line (long windows), but at
+        % short windows the perpendicular peaks are noisy and the fit
+        % drifts -- so we keep the rough-corner path as an always-on
+        % safety net.  The first set of corners that decodes wins; the
+        % stats counter records both attempts when both happen.
+        cornersList = {roughCorners};
         if refineCorners
-            refined = refineQuadCorners_local(countImg, corners, refineSearchPx);
+            refined = refineQuadCorners_local(countImg, roughCorners, refineSearchPx);
             if ~any(isnan(refined(:))) && ~any(isinf(refined(:)))
-                corners = orderCornersForUnwarp_local(refined);
+                refinedOrdered = orderCornersForUnwarp_local(refined);
+                cornersList = {refinedOrdered, roughCorners};   % refined first
             end
         end
 
-        warpedImg = unwarpQuad_local(countSrc, corners, markerCoords, sideSize);
-        if isempty(warpedImg), continue; end
-        if isa(warpedImg, 'gpuArray')
-            warpedImg = gather(warpedImg);
-        end
+        mid = -1;
+        for ci = 1:length(cornersList)
+            corners = cornersList{ci};
+            warpedImg = unwarpQuad_local(countSrc, corners, markerCoords, sideSize);
+            if isempty(warpedImg), continue; end
+            if isa(warpedImg, 'gpuArray')
+                warpedImg = gather(warpedImg);
+            end
 
-        stats(4) = stats(4) + 1;          % decodeAttempts
-        mid = decodeMarker_local( ...
-            warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs, hammingThresh);
+            stats(4) = stats(4) + 1;          % decodeAttempts
+            mid = decodeMarker_local( ...
+                warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs, hammingThresh);
+            if mid >= 0
+                stats(5) = stats(5) + 1;      % decodeSuccess (any ID)
+                break;                         % first corners that decode win
+            end
+        end
         if mid < 0, continue; end
-        stats(5) = stats(5) + 1;          % decodeSuccess (any ID, before filter)
 
         % Filter: in legacy single-marker mode, accept any decoded ID
         % that passes requestedMarkerIds. In multi-marker mode the
