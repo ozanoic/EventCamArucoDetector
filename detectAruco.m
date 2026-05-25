@@ -54,6 +54,8 @@ if ~isfield(params,'requestedMarkerIds'),   params.requestedMarkerIds   = []; en
 if ~isfield(params,'earlyExitOnFirstHit'),  params.earlyExitOnFirstHit  = false; end
 if ~isfield(params,'detectScale'),          params.detectScale          = 1.0;  end
 if ~isfield(params,'useGPU'),               params.useGPU               = false; end
+if ~isfield(params,'decoderHammingDist'),   params.decoderHammingDist   = 0;    end
+if ~isfield(params,'minEventsPerWindow'),   params.minEventsPerWindow   = 10;   end
 
 % Normalise requested marker IDs into a sorted int32 row vector.
 requestedMarkerIds = int32(params.requestedMarkerIds(:)');
@@ -156,6 +158,15 @@ showVis           = params.showVis;
 earlyExitOnHit    = logical(params.earlyExitOnFirstHit);
 detectScale       = params.detectScale;
 useGPU            = logical(params.useGPU);
+hammingThresh     = max(0, round(params.decoderHammingDist));
+minEventsPerWin   = max(1, round(params.minEventsPerWindow));
+if hammingThresh > 0
+    fprintf('Decoder Hamming threshold: %d  (accept decodes within %d bit-flips of any dict code)\n', ...
+        hammingThresh, hammingThresh);
+end
+if minEventsPerWin ~= 10
+    fprintf('minEventsPerWindow = %d  (skip windows with fewer events)\n', minEventsPerWin);
+end
 
 if detectScale <= 0 || detectScale > 1
     error('detectAruco: params.detectScale must be in (0, 1]; got %g.', detectScale);
@@ -232,7 +243,8 @@ if hasParallel
                 markerCoords, sideSize, ...
                 numCells, codeSize, cellPx, ...
                 dict_c.Value.codes, dict_c.Value.ids, ...
-                requestedMarkerIds, reportedIdsLocal);
+                requestedMarkerIds, reportedIdsLocal, ...
+                hammingThresh, minEventsPerWin);
 
             tickRow(wi) = bestID;
             if nReportedLocal > 0
@@ -282,7 +294,8 @@ else
                 blobParams, detectScale, useGPU, ...
                 markerCoords, sideSize, ...
                 numCells, codeSize, cellPx, ...
-                dictCodes, dictIDs, requestedMarkerIds, reportedIdsLocal);
+                dictCodes, dictIDs, requestedMarkerIds, reportedIdsLocal, ...
+                hammingThresh, minEventsPerWin);
 
             tickRow(wi) = bestID;
             if nReportedLocal > 0
@@ -541,7 +554,8 @@ function [bestID, detVec] = processWindow_local( ...
         blobParams, detectScale, useGPU, ...
         markerCoords, sideSize, ...
         numCells, codeSize, cellPx, ...
-        dictCodes, dictIDs, requestedMarkerIds, reportedIds)
+        dictCodes, dictIDs, requestedMarkerIds, reportedIds, ...
+        hammingThresh, minEventsPerWindow)
     % Full per-window pipeline: slice events -> count image -> blob detect
     % -> per-quad unwarp -> decode.
     %
@@ -574,7 +588,7 @@ function [bestID, detVec] = processWindow_local( ...
     iStart = bsearchLeft(evT, tFrom);
     iEnd   = bsearchRight(evT, tNow_q);
     nEv = iEnd - iStart + 1;
-    if nEv < 10, return; end
+    if nEv < minEventsPerWindow, return; end
 
     % evX / evY may be uint16 (compact storage); cast to double for the
     % logical comparisons and accumarray subscripts.
@@ -638,7 +652,7 @@ function [bestID, detVec] = processWindow_local( ...
         end
 
         mid = decodeMarker_local( ...
-            warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs);
+            warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs, hammingThresh);
         if mid < 0, continue; end
 
         % Filter: in legacy single-marker mode, accept any decoded ID
@@ -699,9 +713,19 @@ function warped = unwarpQuad_local(img, srcCorners, dstCorners, sideSize)
 end
 
 function markerID = decodeMarker_local( ...
-        warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs)
+        warpedImg, numCells, codeSize, cellPx, dictCodes, dictIDs, hammingThresh)
+    % hammingThresh : 0 (default) -> exact bit-for-bit dictionary match.
+    %                 k > 0       -> accept the closest dictionary code if
+    %                                its Hamming distance to the decoded
+    %                                36-bit pattern is <= k. ARUCO_MIP_36h12
+    %                                has minimum inter-marker Hamming
+    %                                distance 12, so k up to ~4 still gives
+    %                                unambiguous decoding.
+    if nargin < 7, hammingThresh = 0; end
 
     markerID = -1;
+    bestApproxID = -1;
+    bestApproxDist = inf;
 
     warpedDbl = double(warpedImg);
     if max(warpedDbl(:)) == 0, return; end
@@ -828,14 +852,55 @@ function markerID = decodeMarker_local( ...
                             code = bitor(code, bitshift(bit, 36 - ((r-1)*codeSize + c)));
                         end
                     end
-                    idx = bsearchCode(dictCodes, code);
-                    if idx > 0
-                        markerID = dictIDs(idx);
-                        return;
+                    if hammingThresh == 0
+                        idx = bsearchCode(dictCodes, code);
+                        if idx > 0
+                            markerID = dictIDs(idx);
+                            return;
+                        end
+                    else
+                        % Hamming-tolerant lookup: XOR with every dict
+                        % code, count bits, take the minimum.
+                        xors  = bitxor(uint64(code), dictCodes);
+                        dists = popcount64Vec(xors);
+                        [minDist, mi] = min(dists);
+                        if minDist == 0
+                            markerID = dictIDs(mi);
+                            return;
+                        end
+                        if minDist <= hammingThresh && minDist < bestApproxDist
+                            bestApproxDist = minDist;
+                            bestApproxID   = dictIDs(mi);
+                        end
                     end
                 end
             end
         end
+    end
+
+    % After exhausting every variant: if we collected an approximate
+    % match (Hamming threshold > 0 and best <= threshold), return it.
+    if hammingThresh > 0 && bestApproxID >= 0
+        markerID = bestApproxID;
+    end
+end
+
+function n = popcount64Vec(x)
+    % Population count (Hamming weight) for a vector/array of uint64 values.
+    % Uses a 256-entry byte lookup table -- works around MATLAB's saturating
+    % uint64 multiply, which makes the classic SWAR trick give wrong answers.
+    persistent T8
+    if isempty(T8)
+        T8 = uint8(zeros(1, 256));
+        for ii = 0:255
+            T8(ii + 1) = sum(bitget(uint8(ii), 1:8));
+        end
+    end
+    x = uint64(x);
+    n = zeros(size(x));
+    for k = 0:7
+        byte = bitand(bitshift(x, -8*k), uint64(255));
+        n = n + double(T8(double(byte) + 1));
     end
 end
 
