@@ -1,3 +1,20 @@
+%% Real-data-focused detector (new pipeline)
+% The original script is preserved below. This handoff runs the new
+% Professor* detector and saves *_professor_results.mat files.
+ProfessorEventArucoMain();
+return;
+
+eventFile = "Data/OzanEventData_22.05.2026/4/4.mat";
+resultFile = "Data/OzanEventData_22.05.2026/4/4_professor_micro_results.mat";
+
+opts = struct( ...
+    'sensorSize', [480 640], ...
+    'onlyDetections', false, ...
+    'step', 20, ...
+    'pauseSeconds', 0.03);
+
+visualizeProfessorResults(eventFile, resultFile, opts);
+return;
 %% Event Camera ArUco Marker Detection
 % Configure input file and parameters, then run detection.
 clear; close all; clc;
@@ -9,7 +26,7 @@ addpath("Utils");
 % filterEventNoise('Data/OzanEventData_22.05.2026/1/1.mat', struct('method', 'hot+bg', 'dt_ms', 1));
 
 %% ---- Input ----
-matFiles    = ["Data/OzanEventData_22.05.2026/3/3_reduced.mat"];
+matFiles    = ["Data/OzanEventData_22.05.2026/3/3.mat"];
 % reduceEventResolution('Data/OzanEventData_22.05.2026/4/4.mat');
 
 % matFiles    = ["Data/OzanEventData_22.05.2026/1/1_reduced.mat",...
@@ -31,8 +48,8 @@ matFiles    = ["Data/OzanEventData_22.05.2026/3/3_reduced.mat"];
 %     "Data/marker_z2_zoom_med/marker_z2_zoom_med.mat", ...
 %     "Data/marker_z2_zoom_high/marker_z2_zoom_high.mat"];
 
-sensorSize = [240, 320];   % [height, width]
-% sensorSize = [480, 640];   % [height, width]
+% sensorSize = [240, 320];   % [height, width]
+sensorSize = [480, 640];   % [height, width]
 
 %% ---- Parameters ----
 params.windowDurations_ms = [3, 5, 8, 10, 15, 20, 30, 50, 70];
@@ -55,7 +72,7 @@ params.earlyExitOnFirstHit = true;
 % detectScale: run blob detection at this fraction of full resolution.
 %   1.0 = no downscale (default).  0.5 = ~4x faster blob stage.
 %   Corners are scaled back up before the perspective warp.
-params.detectScale = 1.0;
+params.detectScale = 0.5;
 
 % useGPU: push the per-quad imwarp to GPU. Requires an NVIDIA GPU and
 %   forces sequential execution (parfor can't share a GPU efficiently).
@@ -95,9 +112,9 @@ params.codeSize = 6;
 params.cellPx   = 20;      % pixels per cell in unwarped image
 
 % Blob detection
-params.blobParams.minArea   = 100;
-params.blobParams.maxArea   = sensorSize(1) * sensorSize(2) * 0.6;
-params.blobParams.maxAspect = 3.0;
+params.blobParams.minArea   = 400;
+params.blobParams.maxArea   = sensorSize(1) * sensorSize(2) * 0.1;
+params.blobParams.maxAspect = 2.0;
 
 for i = 1:length(matFiles)
     %% ---- Run detection ----
@@ -109,7 +126,7 @@ for i = 1:length(matFiles)
     save(outputFile, '-struct', 'results');
     fprintf('Results saved to %s\n', outputFile);
 
-    diagnoseFailures(outputFile, matFiles(i), struct('mode', 'both'));
+    diagnoseFailures(outputFile, matFiles(i), struct('playback', true, 'mode', 'both', 'windowMs', 10, 'stepMs', 40, 'saveVideo', true));
 end
 
 %%
